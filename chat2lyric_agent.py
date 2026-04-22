@@ -1,29 +1,29 @@
 """
-WeChatChat2Lyric-Agent v4.0
-Graph-based Multi-Agent System
+WeChatChat2Lyric-Agent v5.0
+Self-Optimizing Agent System
 
 核心架构：
-- DAG Workflow Engine（可插拔、可条件路由）
-- Targeted Repair Loop（精准定位问题）
-- Beat-Structured Skeleton（可执行计划）
-- 7个独立 Agent 分工协作
+- Global Constraint Controller（冻结高分维度，避免震荡）
+- Diff-based Editing（精确修改局部）
+- Unified Objective Function（全局优化目标）
+- Meta-Agent（学习修复历史，经验驱动优化）
+
+解决 v4.0 的核心问题：non-converging multi-objective optimization
 """
 
 import os
 import re
 import sys
 import json
-from typing import List, Dict, Optional, Callable, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Set
 from dataclasses import dataclass, field
 from enum import Enum
 from dotenv import load_dotenv
 from datetime import datetime
 from collections import defaultdict
 
-# LangChain 核心
 from langchain.chat_models import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.prompts import ChatPromptTemplate
+from langchain.schema import HumanMessage
 
 # ==================== 配置 ====================
 load_dotenv()
@@ -34,7 +34,6 @@ MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-chat")
 
 GENRE_OPTIONS = ["流行", "民谣", "说唱", "抒情", "摇滚"]
 
-# 全局 LLM
 llm = ChatOpenAI(
     openai_api_key=API_KEY,
     openai_api_base=API_BASE,
@@ -44,155 +43,404 @@ llm = ChatOpenAI(
 )
 
 
-# ==================== DAG Workflow Engine ====================
+# ==================== 全局约束控制器 ====================
 
-class NodeType(Enum):
-    """节点类型"""
-    AGENT = "agent"
-    CONDITION = "condition"
-    MERGE = "merge"
-    OUTPUT = "output"
-
-
-@dataclass
-class DAGNode:
-    """DAG 节点"""
-    id: str
-    type: NodeType
-    agent_name: str = ""
-    params: Dict = field(default_factory=dict)
-    condition_fn: Callable = None  # 条件函数
-    on_fail: str = ""  # 失败时跳转
-    on_success: str = ""  # 成功时跳转
-
-
-class DAGWorkflow:
+class ConstraintLock:
     """
-    有向无环图工作流引擎
-    支持：条件路由、节点插拔、并行分支
+    全局约束锁
+    冻结高分维度，避免修复时破坏已达标的部分
     """
 
     def __init__(self):
-        self.nodes: Dict[str, DAGNode] = {}
-        self.edges: Dict[str, List[str]] = defaultdict(list)
-        self.default_output = ""
+        self.locked_dims: Set[str] = set()
+        self.lock_threshold = 8.0  # 超过此分数锁定
+        self.lock_history: List[Dict] = []
 
-    def add_node(self, node: DAGNode):
-        """添加节点"""
-        self.nodes[node.id] = node
-
-    def add_edge(self, from_id: str, to_id: str):
-        """添加边"""
-        self.edges[from_id].append(to_id)
-
-    def set_conditions(self, node_id: str, conditions: Dict[str, str]):
+    def evaluate_and_lock(self, scores: Dict[str, float]) -> Set[str]:
         """
-        设置条件跳转
-        conditions: {"score<7": "fix_rhyme", "score>=7": "next"}
+        评估分数，锁定高分维度
+        返回当前被锁定的维度
         """
-        if node_id in self.nodes:
-            self.nodes[node_id].params["conditions"] = conditions
+        newly_locked = set()
 
-    def execute(self, context: Dict, start_node: str = "load") -> Dict:
-        """执行工作流"""
-        current = start_node
-        visited = set()
-        max_iterations = 50
-        iteration = 0
+        for dim, score in scores.items():
+            if score >= self.lock_threshold and dim not in self.locked_dims:
+                self.locked_dims.add(dim)
+                newly_locked.add(dim)
+                self.lock_history.append({
+                    "dimension": dim,
+                    "score": score,
+                    "action": "LOCK",
+                    "timestamp": datetime.now().isoformat()
+                })
 
-        while current and iteration < max_iterations:
-            iteration += 1
+        return self.locked_dims
 
-            if current in visited:
-                print(f"⚠️ 检测到循环，跳出: {current}")
-                break
+    def is_locked(self, dimension: str) -> bool:
+        return dimension in self.locked_dims
 
-            visited.add(current)
-            node = self.nodes.get(current)
+    def get_locked_dims(self) -> Set[str]:
+        return self.locked_dims.copy()
 
-            if not node:
-                break
+    def unlock_all(self):
+        """重置锁定"""
+        self.locked_dims.clear()
 
-            # 执行节点
-            result = self._execute_node(node, context)
-
-            # 存储结果
-            if result is not None:
-                context[f"{node.id}_result"] = result
-
-            # 决定下一步
-            current = self._get_next_node(node, context)
-
-        return context
-
-    def _execute_node(self, node: DAGNode, context: Dict) -> Any:
-        """执行单个节点"""
-        if node.type == NodeType.AGENT:
-            # 调用对应的 Agent
-            agent = AgentRegistry.get(node.agent_name)
-            if agent:
-                return agent.execute(context, **node.params)
-        elif node.type == NodeType.OUTPUT:
-            return context.get("lyrics", "")
-
-        return None
-
-    def _get_next_node(self, node: DAGNode, context: Dict) -> str:
-        """根据条件决定下一步"""
-        if node.type == NodeType.OUTPUT:
-            return None
-
-        # 检查是否有条件跳转
-        conditions = node.params.get("conditions", {})
-        if conditions:
-            for cond, next_node in conditions.items():
-                if self._evaluate_condition(cond, context):
-                    return next_node
-
-        # 默认走第一条边
-        edges = self.edges.get(node.id, [])
-        return edges[0] if edges else None
-
-    def _evaluate_condition(self, cond: str, context: Dict) -> bool:
-        """评估条件表达式"""
-        try:
-            # 简单条件解析：score<7, emotion_match<7, etc.
-            for key in ["score", "rhythm", "emotion_match", "structure", "rhyme"]:
-                if key in cond:
-                    val = context.get(f"{key}_score", 0)
-                    op = "<" if "<" in cond else ">=" if ">=" in cond else ">"
-                    threshold = float(cond.split(op)[1].strip())
-                    if op == "<":
-                        return val < threshold
-                    elif op == ">=":
-                        return val >= threshold
-            return False
-        except:
-            return False
+    def get_lock_report(self) -> str:
+        if not self.locked_dims:
+            return "无锁定维度"
+        return f"已锁定: {', '.join(self.locked_dims)}"
 
 
-# ==================== Beat-Structured Skeleton ====================
+# ==================== 差分编辑器 ====================
+
+@dataclass
+class EditAction:
+    """编辑操作"""
+    line_index: int
+    action_type: str  # "fix_rhyme", "boost_emotion", "modify"
+    target_content: str = ""
+    original_content: str = ""
+    reason: str = ""
+
+
+class DiffEditor:
+    """
+    差分编辑器
+    只修改局部，不整段重写
+    """
+
+    def __init__(self):
+        self.edit_history: List[EditAction] = []
+        self.line_cache: List[str] = []
+
+    def parse_lyrics_to_lines(self, lyrics: str) -> List[str]:
+        """解析歌词为行列表"""
+        lines = []
+        sections = []
+
+        for line in lyrics.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('[') and line.endswith(']'):
+                sections.append(line)
+                lines.append(line)  # 保留段落标记
+            else:
+                lines.append(line)
+
+        return lines
+
+    def apply_line_edit(self, lyrics: str, edit: EditAction) -> str:
+        """应用单行编辑"""
+        lines = self.parse_lyrics_to_lines(lyrics)
+
+        if 0 <= edit.line_index < len(lines):
+            # 跳过段落标记行
+            target_idx = edit.line_index
+            if lines[target_idx].startswith('['):
+                target_idx += 1
+
+            if target_idx < len(lines):
+                original = lines[target_idx]
+                lines[target_idx] = edit.target_content
+
+                edit.original_content = original
+                self.edit_history.append(edit)
+
+        return '\n'.join(lines)
+
+    def apply_batch_edits(self, lyrics: str, edits: List[EditAction]) -> str:
+        """批量应用编辑"""
+        result = lyrics
+
+        # 按行索引排序（从低到高，避免索引偏移）
+        sorted_edits = sorted(edits, key=lambda e: e.line_index)
+
+        for edit in sorted_edits:
+            result = self.apply_line_edit(result, edit)
+
+        return result
+
+    def generate_targeted_edit_plan(
+        self,
+        lyrics: str,
+        issues: List[str],
+        locked_dims: Set[str]
+    ) -> List[EditAction]:
+        """
+        生成精确的编辑计划
+        基于问题定位，生成最小编辑集
+        """
+        lines = self.parse_lyrics_to_lines(lyrics)
+        edit_plan = []
+
+        # 分析问题类型
+        rhyme_issues = [i for i in issues if '押韵' in i or 'rhyme' in i.lower()]
+        emotion_issues = [i for i in issues if '情感' in i or 'emotion' in i.lower()]
+        structure_issues = [i for i in issues if '结构' in i or '句数' in i]
+
+        # 为押韵问题定位目标行
+        if rhyme_issues and 'rhyme' not in locked_dims:
+            # 找最后一行（最可能是问题行）
+            last_meaningful_idx = len(lines) - 1
+            while last_meaningful_idx >= 0 and lines[last_meaningful_idx].startswith('['):
+                last_meaningful_idx -= 1
+
+            if last_meaningful_idx >= 0:
+                edit_plan.append(EditAction(
+                    line_index=last_meaningful_idx,
+                    action_type="fix_rhyme",
+                    reason=f"修复押韵: {rhyme_issues[0]}"
+                ))
+
+        # 为情感问题定位
+        if emotion_issues and 'emotion' not in locked_dims:
+            # 副歌部分通常是情感核心
+            for i, line in enumerate(lines):
+                if line.startswith('[副歌]') or (i > 0 and 'chorus' in line.lower()):
+                    edit_plan.append(EditAction(
+                        line_index=i + 1,
+                        action_type="boost_emotion",
+                        reason=f"增强情感: {emotion_issues[0]}"
+                    ))
+                    break
+
+        return edit_plan
+
+
+# ==================== 统一目标优化器 ====================
+
+@dataclass
+class OptimizationWeights:
+    """优化权重配置"""
+    rhythm: float = 0.25
+    emotion: float = 0.30
+    structure: float = 0.20
+    rhyme: float = 0.15
+    keyword: float = 0.10
+
+
+class GlobalOptimizer:
+    """
+    全局目标优化器
+    将多维分数统一为单一目标
+    """
+
+    def __init__(self, weights: OptimizationWeights = None):
+        self.weights = weights or OptimizationWeights()
+        self.history: List[Dict] = []
+
+    def compute_global_score(self, scores: Dict[str, float]) -> float:
+        """
+        计算全局分数
+        weighted sum = w1*s1 + w2*s2 + ...
+        """
+        w = self.weights
+
+        total = (
+            w.rhythm * scores.get("rhythm_quality", 0) +
+            w.emotion * scores.get("emotion_match", 0) +
+            w.structure * scores.get("structure_compliance", 0) +
+            w.rhyme * scores.get("rhyme_quality", 0) +
+            w.keyword * scores.get("keyword_coverage", 0)
+        )
+
+        return round(total, 2)
+
+    def get_improvement_direction(
+        self,
+        current_scores: Dict[str, float],
+        target_scores: Dict[str, float]
+    ) -> List[Tuple[str, float]]:
+        """
+        获取改进方向
+        返回：(维度, 改进优先级) 按优先级排序
+        """
+        improvements = []
+
+        for dim in ["rhythm", "emotion", "structure", "rhyme", "keyword"]:
+            score_key = f"{dim}_quality" if dim != "emotion" else "emotion_match"
+            current = current_scores.get(score_key, 0)
+            target = target_scores.get(score_key, 8.0)
+            gap = target - current
+
+            if gap > 0.5:  # 只考虑显著差距
+                # 考虑权重加权
+                weight = getattr(self.weights, dim, 0.2)
+                priority = gap * weight
+                improvements.append((dim, priority))
+
+        # 按优先级排序
+        improvements.sort(key=lambda x: x[1], reverse=True)
+        return improvements
+
+    def should_continue_optimizing(
+        self,
+        current_scores: Dict[str, float],
+        iteration: int,
+        max_iterations: int = 5
+    ) -> Tuple[bool, str]:
+        """
+        判断是否继续优化
+        返回：(是否继续, 原因)
+        """
+        global_score = self.compute_global_score(current_scores)
+
+        # 检查是否达标
+        if global_score >= 8.0:
+            return False, f"全局分数达标 ({global_score})"
+
+        # 检查迭代次数
+        if iteration >= max_iterations:
+            return False, f"达到最大迭代次数 ({max_iterations})"
+
+        # 检查是否收敛（分数变化小于阈值）
+        if len(self.history) >= 2:
+            prev_score = self.compute_global_score(self.history[-1])
+            delta = global_score - prev_score
+            if abs(delta) < 0.1:
+                return False, f"收敛 (delta={delta})"
+
+        return True, f"继续优化 (global={global_score})"
+
+    def record_iteration(self, scores: Dict, action: str):
+        """记录迭代历史"""
+        self.history.append({
+            "iteration": len(self.history),
+            "scores": scores.copy(),
+            "global_score": self.compute_global_score(scores),
+            "action": action,
+            "timestamp": datetime.now().isoformat()
+        })
+
+
+# ==================== Meta-Agent（核心创新）====================
+
+class MetaAgent:
+    """
+    元优化 Agent
+    学习修复历史，决定最优修复策略
+    从"规则驱动" → "经验驱动"
+    """
+
+    def __init__(self):
+        self.repair_success_log: List[Dict] = []
+        self.repair_failure_log: List[Dict] = []
+        self.strategy_preference: Dict[str, float] = defaultdict(float)
+
+    def analyze_repair_outcome(
+        self,
+        repair_action: str,
+        scores_before: Dict,
+        scores_after: Dict,
+        issue_dim: str
+    ):
+        """
+        分析修复结果
+        记录成功/失败经验
+        """
+        before_global = sum(scores_before.values()) / len(scores_before)
+        after_global = sum(scores_after.values()) / len(scores_after)
+        delta = after_global - before_global
+
+        record = {
+            "action": repair_action,
+            "issue_dim": issue_dim,
+            "delta": delta,
+            "scores_before": scores_before,
+            "scores_after": scores_after,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        if delta > 0.3:
+            self.repair_success_log.append(record)
+            self.strategy_preference[repair_action] += delta
+        elif delta < -0.2:
+            self.repair_failure_log.append(record)
+            self.strategy_preference[repair_action] += delta
+
+    def get_optimal_action_sequence(self, issue_dim: str) -> List[str]:
+        """
+        获取最优操作序列
+        基于历史学习
+        """
+        # 分析相关维度的成功操作
+        relevant_successes = [
+            r for r in self.repair_success_log
+            if r["issue_dim"] == issue_dim
+        ]
+
+        if not relevant_successes:
+            # 默认顺序
+            return ["fix_structure", "fix_rhyme", "boost_emotion"]
+
+        # 按 delta 排序
+        relevant_successes.sort(key=lambda x: x["delta"], reverse=True)
+
+        return [r["action"] for r in relevant_successes[:3]]
+
+    def get_avoid_actions(self, issue_dim: str) -> List[str]:
+        """获取应避免的操作"""
+        relevant_failures = [
+            r for r in self.repair_failure_log
+            if r["issue_dim"] == issue_dim
+        ]
+        return [r["action"] for r in relevant_failures]
+
+    def should_skip_repair(
+        self,
+        repair_action: str,
+        current_scores: Dict,
+        locked_dims: Set[str]
+    ) -> Tuple[bool, str]:
+        """
+        判断是否跳过某修复
+        基于历史经验
+        """
+        # 检查是否锁定
+        for dim in ["rhyme", "emotion", "structure"]:
+            if dim in repair_action and dim in locked_dims:
+                return True, f"{dim} 已锁定，跳过 {repair_action}"
+
+        # 检查历史失败率
+        action_failures = [
+            r for r in self.repair_failure_log
+            if r["action"] == repair_action
+        ]
+        action_successes = [
+            r for r in self.repair_success_log
+            if r["action"] == repair_action
+        ]
+
+        total = len(action_failures) + len(action_successes)
+        if total >= 3:
+            failure_rate = len(action_failures) / total
+            if failure_rate > 0.6:
+                return True, f"{repair_action} 失败率 {failure_rate:.0%}，跳过"
+
+        return False, "继续执行"
+
+
+# ==================== 核心数据结构 ====================
 
 @dataclass
 class SectionPlan:
-    """段落计划（Beat-Structured 的核心）"""
-    section_type: str  # verse1, chorus, verse2, bridge, chorus
+    """段落计划"""
+    section_type: str
     lines: int
-    emotion: str  # low, rising, peak, fall
-    theme: str  # 段落主题
-    keywords: List[str]  # 必须包含的词
-    rhyme_end: str = ""  # 韵脚（如：ang, ian, ou）
-    hook_line: str = ""  # 金句（仅用于chorus）
-    tone: str = ""  # 语气（温柔/强烈/低沉）
-    melody_hint: str = ""  # 旋律暗示（上行/下行/平稳）
+    emotion: str
+    theme: str
+    keywords: List[str]
+    rhyme_end: str = ""
+    hook_line: str = ""
+    tone: str = ""
+    melody_hint: str = ""
 
 
 @dataclass
 class BeatStructuredSkeleton:
-    """
-    可执行的歌词骨架
-    每个段落都有明确的执行指令
-    """
+    """骨架"""
     sections: List[SectionPlan] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
@@ -231,51 +479,25 @@ class BeatStructuredSkeleton:
         return BeatStructuredSkeleton(sections=sections)
 
 
-# ==================== Agent 基类 ====================
+# ==================== Agent 实现 ====================
 
 class BaseAgent:
-    """Agent 基类"""
-
     name = "base"
 
     @classmethod
     def execute(cls, context: Dict, **kwargs) -> Any:
-        """执行 Agent"""
         raise NotImplementedError
 
 
-class AgentRegistry:
-    """Agent 注册表"""
-
-    _agents: Dict[str, type] = {}
-
-    @classmethod
-    def register(cls, name: str, agent_class: type):
-        cls._agents[name] = agent_class
-
-    @classmethod
-    def get(cls, name: str) -> Optional[type]:
-        return cls._agents.get(name)
-
-    @classmethod
-    def list_agents(cls) -> List[str]:
-        return list(cls._agents.keys())
-
-
-# ==================== Agent 实现 ====================
-
 class CleanerAgent(BaseAgent):
-    """清洗 Agent"""
-
     name = "clean"
 
     @classmethod
     def execute(cls, context: Dict, **kwargs) -> str:
         raw_text = context.get("raw_text", "")
-
-        # 正则预清洗
         lines = raw_text.split('\n')
         cleaned_lines = []
+
         timestamp_pattern = r'\d{4}[/\-]\d{1,2}[/\-]\d{1,2}\s+\d{1,2}:\d{2}(:\d{2})?'
         system_patterns = [
             r'^以上是打招呼内容', r'^以上是正文内容', r'^点击添加备注',
@@ -294,12 +516,11 @@ class CleanerAgent(BaseAgent):
 
         cleaned = '\n'.join(cleaned_lines)
 
-        # LLM 深度清洗
-        prompt = f"""清洗微信聊天记录，每行一条消息，保留核心语义：
+        prompt = f"""清洗微信聊天记录，每行一条消息：
 
 {cleaned}
 
-直接输出清洗结果："""
+直接输出："""
 
         try:
             response = llm([HumanMessage(content=prompt)])
@@ -309,24 +530,21 @@ class CleanerAgent(BaseAgent):
 
 
 class EmotionAnalystAgent(BaseAgent):
-    """情感分析 Agent"""
-
     name = "analyze"
 
     @classmethod
     def execute(cls, context: Dict, **kwargs) -> Dict:
         cleaned_text = context.get("cleaned_text", "")
 
-        prompt = f"""深度分析聊天记录，输出严格JSON：
+        prompt = f"""分析聊天记录，输出JSON：
 
 {{
-    "emotion": "主要情感",
+    "emotion": "情感",
     "emotion_detail": "情感细化",
     "keywords": ["词1", "词2", "词3", "词4", "词5"],
-    "story": "故事线（60字内）",
+    "story": "故事线",
     "relationship": "人物关系",
-    "emotion_curve": ["low", "rising", "peak", "fall", "peak"],
-    "core_theme": "核心主题词"
+    "emotion_curve": ["low", "rising", "peak", "fall", "peak"]
 }}
 
 聊天记录：
@@ -337,29 +555,17 @@ class EmotionAnalystAgent(BaseAgent):
         try:
             response = llm([HumanMessage(content=prompt)])
             result = response.content.strip()
-
             if '```json' in result:
                 result = result.split('```json')[1].split('```')[0]
-
             return json.loads(result)
         except:
             return {
-                "emotion": "未知",
-                "emotion_detail": "",
-                "keywords": [],
-                "story": "",
-                "relationship": "",
-                "emotion_curve": ["low", "rising", "peak", "fall", "peak"],
-                "core_theme": ""
+                "emotion": "未知", "emotion_detail": "", "keywords": [],
+                "story": "", "relationship": "", "emotion_curve": []
             }
 
 
 class SkeletonPlannerAgent(BaseAgent):
-    """
-    骨架规划 Agent - 生成 Beat-Structured Skeleton
-    这是 v4.0 核心升级：从"描述"到"可执行计划"
-    """
-
     name = "plan"
 
     @classmethod
@@ -371,44 +577,25 @@ class SkeletonPlannerAgent(BaseAgent):
         genre = context.get("genre", "流行")
 
         genre_rhyme = {
-            "流行": ["ang", "ian", "ou", "ei"],
-            "民谣": ["an", "en", "ing", "ong"],
-            "说唱": ["a", "e", "i", "ou", "an"],
-            "抒情": ["ang", "ian", "ao", "ou"],
-            "摇滚": ["ang", "ong", "ai", "ei"]
+            "流行": ["ang", "ian", "ou"],
+            "民谣": ["an", "en", "ing"],
+            "说唱": ["a", "e", "i", "ou"],
+            "抒情": ["ang", "ian", "ao"],
+            "摇滚": ["ang", "ong", "ai"]
         }
-
-        genre_melody = {
-            "流行": ["平稳", "上行", "平稳", "下行"],
-            "民谣": ["下行", "平稳", "上行", "平稳"],
-            "说唱": ["上行", "上行", "上行", "上行"],
-            "抒情": ["下行", "上行", "peak", "下行"],
-            "摇滚": ["上行", "上行", "peak", "上行"]
-        }
-
         rhyme_options = genre_rhyme.get(genre, ["ang", "ian"])
-        melody_options = genre_melody.get(genre, ["平稳", "上行"])
 
-        prompt = f"""你是顶级歌词策划师。生成可执行的 Beat-Structured Skeleton。
-
-## 输入
-- 情感：{emotion} - {emotion_detail}
-- 关键词：{', '.join(keywords)}
-- 故事：{story}
-- 曲风：{genre}
-
-## 输出格式（严格JSON）
-每个段落必须是"可执行的指令"：
+        prompt = f"""生成 Beat-Structured Skeleton（严格JSON）：
 
 {{
     "sections": [
- {{
+        {{
             "section_type": "verse1",
             "lines": 4,
             "emotion": "low",
-            "theme": "引入故事背景",
-            "keywords": ["词1", "词2"],
-            "rhyme_end": "ang",
+            "theme": "引入故事",
+            "keywords": ["{keywords[0] if keywords else '情感'}"],
+            "rhyme_end": "{rhyme_options[0]}",
             "hook_line": "",
             "tone": "叙事",
             "melody_hint": "下行"
@@ -417,10 +604,10 @@ class SkeletonPlannerAgent(BaseAgent):
             "section_type": "chorus",
             "lines": 4,
             "emotion": "peak",
-            "theme": "情感爆发点",
-            "keywords": ["核心词1", "核心词2"],
-            "rhyme_end": "ian",
-            "hook_line": "副歌金句（必须押韵，10字内）",
+            "theme": "情感高潮",
+            "keywords": ["{keywords[1] if len(keywords) > 1 else keywords[0]}"],
+            "rhyme_end": "{rhyme_options[1] if len(rhyme_options) > 1 else rhyme_options[0]}",
+            "hook_line": "核心金句（10字内押韵）",
             "tone": "强烈",
             "melody_hint": "上行"
         }},
@@ -428,9 +615,9 @@ class SkeletonPlannerAgent(BaseAgent):
             "section_type": "verse2",
             "lines": 4,
             "emotion": "rising",
-            "theme": "延续+递进",
-            "keywords": ["词3", "词4"],
-            "rhyme_end": "ou",
+            "theme": "延续递进",
+            "keywords": ["{keywords[2] if len(keywords) > 2 else keywords[0]}"],
+            "rhyme_end": "{rhyme_options[0]}",
             "hook_line": "",
             "tone": "叙事",
             "melody_hint": "平稳"
@@ -440,8 +627,8 @@ class SkeletonPlannerAgent(BaseAgent):
             "lines": 4,
             "emotion": "fall",
             "theme": "情感转折",
-            "keywords": ["转折词1", "转折词2"],
-            "rhyme_end": "en",
+            "keywords": ["{keywords[3] if len(keywords) > 3 else keywords[0]}"],
+            "rhyme_end": "{rhyme_options[1] if len(rhyme_options) > 1 else rhyme_options[0]}",
             "hook_line": "",
             "tone": "低沉",
             "melody_hint": "下行"
@@ -449,42 +636,37 @@ class SkeletonPlannerAgent(BaseAgent):
     ]
 }}
 
-要求：
-1. 押韵词从 {rhyme_options} 选择
-2. 情感曲线必须包含 low→rising→peak→fall→peak
-3. 每段必须有明确的 theme 描述
-4. chorus 必须有 hook_line（金句）
-5. keywords 必须来自输入的关键词
+情感：{emotion} - {emotion_detail}
+曲风：{genre}
 
-直接输出JSON，不要解释："""
+直接输出JSON："""
 
         try:
             response = llm([HumanMessage(content=prompt)])
             result = response.content.strip()
-
             if '```json' in result:
                 result = result.split('```json')[1].split('```')[0]
-
             return json.loads(result)
         except:
-            # 默认骨架
             return {
                 "sections": [
-                    {"section_type": "verse1", "lines": 4, "emotion": "low", "theme": "引入",
-                     "keywords": keywords[:2], "rhyme_end": "ang", "hook_line": "", "tone": "叙事", "melody_hint": "下行"},
-                    {"section_type": "chorus", "lines": 4, "emotion": "peak", "theme": "高潮",
-                     "keywords": keywords[:2], "rhyme_end": "ian", "hook_line": "我们的故事继续", "tone": "强烈", "melody_hint": "上行"},
-                    {"section_type": "verse2", "lines": 4, "emotion": "rising", "theme": "延续",
-                     "keywords": keywords[:2], "rhyme_end": "ou", "hook_line": "", "tone": "叙事", "melody_hint": "平稳"},
-                    {"section_type": "bridge", "lines": 4, "emotion": "fall", "theme": "转折",
-                     "keywords": keywords[:1], "rhyme_end": "en", "hook_line": "", "tone": "低沉", "melody_hint": "下行"},
+                    {"section_type": "verse1", "lines": 4, "emotion": "low",
+                     "theme": "引入", "keywords": keywords[:2], "rhyme_end": "ang",
+                     "hook_line": "", "tone": "叙事", "melody_hint": "下行"},
+                    {"section_type": "chorus", "lines": 4, "emotion": "peak",
+                     "theme": "高潮", "keywords": keywords[:2], "rhyme_end": "ian",
+                     "hook_line": "我们的故事", "tone": "强烈", "melody_hint": "上行"},
+                    {"section_type": "verse2", "lines": 4, "emotion": "rising",
+                     "theme": "延续", "keywords": keywords[:2], "rhyme_end": "ou",
+                     "hook_line": "", "tone": "叙事", "melody_hint": "平稳"},
+                    {"section_type": "bridge", "lines": 4, "emotion": "fall",
+                     "theme": "转折", "keywords": keywords[:1], "rhyme_end": "en",
+                     "hook_line": "", "tone": "低沉", "melody_hint": "下行"},
                 ]
             }
 
 
 class GeneratorAgent(BaseAgent):
-    """歌词生成 Agent - 基于 Beat-Structured Skeleton"""
-
     name = "generate"
 
     @classmethod
@@ -506,45 +688,25 @@ class GeneratorAgent(BaseAgent):
             "摇滚": "力量感足，节奏强劲"
         }
 
-        # 构建段落约束指令
-        section_instructions = []
+        # 构建约束
+        constraints = []
         for s in skeleton.sections:
-            section_instructions.append(f"""
-[{s.section_type.upper()}]
-- 句数: {s.lines}
-- 情感: {s.emotion}
-- 主题: {s.theme}
-- 必须包含: {', '.join(s.keywords)}
-- 韵脚: {s.rhyme_end}
-- 语气: {s.tone}
-- 旋律: {s.melody_hint}
-{f"- 金句: {s.hook_line}" if s.hook_line else ""}
-""")
+            constraints.append(f"[{s.section_type.upper()}] {s.lines}句 情感:{s.emotion} 韵脚:{s.rhyme_end} 主题:{s.theme}")
 
-        prompt = f"""你是专业的歌词创作者。基于以下结构指令创作歌词。
+        prompt = f"""基于结构创作歌词：
 
-## 曲风
-{genre} - {genre_notes.get(genre, '')}
+曲风：{genre} - {genre_notes.get(genre, '')}
+情感：{emotion} - {emotion_detail}
+关键词：{', '.join(keywords)}
+故事：{story}
 
-## 情感
-{emotion} - {emotion_detail}
+结构：
+{chr(10).join(constraints)}
 
-## 关键词
-{', '.join(keywords)}
-
-## 故事线
-{story}
-
-## 段落结构（必须严格遵循）
-{''.join(section_instructions)}
-
-## 创作要求
-1. 每个段落必须恰好 {sum(s.lines for s in skeleton.sections)} 句
-2. 严格按照指定的韵脚押韵
-3. 情感曲线：low→rising→peak→fall→peak
-4. 包含所有指定的关键词
-5. 禁止真实人名地名
-6. chorus 必须使用金句："{skeleton.sections[1].hook_line if len(skeleton.sections) > 1 else ''}"
+要求：
+1. 严格按句数创作
+2. 按韵脚押韵
+3. 禁止真实人名地名
 
 直接输出歌词："""
 
@@ -555,98 +717,30 @@ class GeneratorAgent(BaseAgent):
             return "生成失败"
 
 
-class RhymeFixerAgent(BaseAgent):
-    """押韵修复 Agent - Targeted Repair"""
-
-    name = "fix_rhyme"
-
-    @classmethod
-    def execute(cls, context: Dict, **kwargs) -> str:
-        lyrics = context.get("lyrics", "")
-        skeleton_data = context.get("skeleton_plan", {})
-
-        prompt = f"""修复以下歌词的押韵问题：
-
-{lyrics}
-
-要求：
-1. 保持原意和情感
-2. 加强句尾押韵（使用 AABB 格式）
-3. 保持原有句数
-4. 直接输出修复后的歌词，不要解释："""
-
-        try:
-            response = llm([HumanMessage(content=prompt)])
-            return response.content.strip()
-        except:
-            return lyrics
-
-
-class EmotionBoostAgent(BaseAgent):
-    """情感增强 Agent - Targeted Repair"""
-
-    name = "boost_emotion"
+class DiffEditAgent(BaseAgent):
+    """
+    差分编辑 Agent
+    v5.0 核心：精确修改局部，不整段重写
+    """
+    name = "diff_edit"
 
     @classmethod
     def execute(cls, context: Dict, **kwargs) -> str:
         lyrics = context.get("lyrics", "")
-        emotion = context.get("emotion", "")
-        emotion_detail = context.get("emotion_detail", "")
+        edit_plan = context.get("edit_plan", [])
 
-        prompt = f"""增强以下歌词的情感表达：
-
-{lyrics}
-
-目标情感：{emotion} - {emotion_detail}
-
-要求：
-1. 保持押韵和结构
-2. 增强情感感染力
-3. 添加更细腻的情感描写
-4. 直接输出，不要解释："""
-
-        try:
-            response = llm([HumanMessage(content=prompt)])
-            return response.content.strip()
-        except:
+        if not edit_plan:
             return lyrics
 
+        # 应用编辑
+        diff_editor = DiffEditor()
+        result = diff_editor.apply_batch_edits(lyrics, edit_plan)
 
-class StructureFixAgent(BaseAgent):
-    """结构修复 Agent - Targeted Repair"""
-
-    name = "fix_structure"
-
-    @classmethod
-    def execute(cls, context: Dict, **kwargs) -> str:
-        lyrics = context.get("lyrics", "")
-        skeleton_data = context.get("skeleton_plan", {})
-
-        skeleton = BeatStructuredSkeleton.from_dict(skeleton_data)
-        expected_lines = sum(s.lines for s in skeleton.sections)
-
-        prompt = f"""修复以下歌词的结构问题：
-
-{lyrics}
-
-要求：
-1. 确保总句数正确
-2. 保持段落标记 [verse1] [chorus] [verse2] [bridge]
-3. 保持押韵
-4. 直接输出，不要解释："""
-
-        try:
-            response = llm([HumanMessage(content=prompt)])
-            return response.content.strip()
-        except:
-            return lyrics
+        return result
 
 
 class VerifierAgent(BaseAgent):
-    """
-    质量审查 Agent - 分解评分 + Targeted Repair 定位
-    v4.0 核心：不仅评分，还精确定位问题
-    """
+    """验证 Agent"""
 
     name = "verify"
 
@@ -660,30 +754,8 @@ class VerifierAgent(BaseAgent):
 
         skeleton = BeatStructuredSkeleton.from_dict(skeleton_data)
 
-        prompt = f"""全面审查歌词质量，按维度评分：
+        prompt = f"""审查歌词（严格JSON）：
 
-## 歌词
-{lyrics}
-
-## 目标情感
-{emotion} - {emotion_detail}
-
-## 关键词
-{', '.join(keywords)}
-
-## 结构要求
-主歌 {skeleton.sections[0].lines if skeleton.sections else 4} 句
-副歌 {skeleton.sections[1].lines if len(skeleton.sections) > 1 else 4} 句
-桥段 {skeleton.sections[3].lines if len(skeleton.sections) > 3 else 4} 句
-
-## 评分维度（每项 0-10）
-1. rhythm_quality: 节奏和句长协调性
-2. emotion_match: 情感匹配度
-3. structure_compliance: 结构合规性
-4. rhyme_quality: 押韵质量
-5. keyword_coverage: 关键词覆盖率
-
-## 输出格式（严格JSON）
 {{
     "overall": 8.5,
     "rhythm_quality": 8.0,
@@ -691,7 +763,7 @@ class VerifierAgent(BaseAgent):
     "structure_compliance": 8.5,
     "rhyme_quality": 8.0,
     "keyword_coverage": 7.5,
-    "issues": ["问题1（定位到具体段落）", "问题2"],
+    "issues": ["问题1", "问题2"],
     "targeted_repairs": {{
         "fix_rhyme": true,
         "boost_emotion": false,
@@ -699,18 +771,24 @@ class VerifierAgent(BaseAgent):
     }}
 }}
 
+歌词：
+{lyrics}
+
+情感：{emotion}
+关键词：{', '.join(keywords)}
+句数要求：主歌{skeleton.sections[0].lines if skeleton.sections else 4}句 副歌{skeleton.sections[1].lines if len(skeleton.sections) > 1 else 4}句
+
 直接输出JSON："""
 
         try:
             response = llm([HumanMessage(content=prompt)])
             result = response.content.strip()
-
             if '```json' in result:
                 result = result.split('```json')[1].split('```')[0]
 
             data = json.loads(result)
 
-            # 存储分数到 context（供条件路由使用）
+            # 存储分数
             context["score"] = data.get("overall", 0)
             context["rhythm_score"] = data.get("rhythm_quality", 0)
             context["emotion_match"] = data.get("emotion_match", 0)
@@ -722,14 +800,13 @@ class VerifierAgent(BaseAgent):
 
         except:
             return {
-                "overall": 5.0,
-                "issues": ["审查失败"],
+                "overall": 5.0, "issues": ["审查失败"],
                 "targeted_repairs": {"fix_rhyme": True, "boost_emotion": True, "fix_structure": True}
             }
 
 
 class TitleAgent(BaseAgent):
-    """标题生成 Agent"""
+    """标题生成"""
 
     name = "title"
 
@@ -737,15 +814,11 @@ class TitleAgent(BaseAgent):
     def execute(cls, context: Dict, **kwargs) -> str:
         lyrics = context.get("lyrics", "")
         emotion = context.get("emotion", "")
-        keywords = context.get("keywords", [])
 
-        prompt = f"""为歌词生成标题（2-6字，有诗意）：
+        prompt = f"""生成歌词标题（2-6字）：
 
-歌词片段：
-{lyrics[:400]}
-
-情感: {emotion}
-关键词: {', '.join(keywords)}
+歌词片段：{lyrics[:300]}
+情感：{emotion}
 
 直接输出标题："""
 
@@ -756,92 +829,12 @@ class TitleAgent(BaseAgent):
             return "无题"
 
 
-# 注册所有 Agent
-AgentRegistry.register("clean", CleanerAgent)
-AgentRegistry.register("analyze", EmotionAnalystAgent)
-AgentRegistry.register("plan", SkeletonPlannerAgent)
-AgentRegistry.register("generate", GeneratorAgent)
-AgentRegistry.register("fix_rhyme", RhymeFixerAgent)
-AgentRegistry.register("boost_emotion", EmotionBoostAgent)
-AgentRegistry.register("fix_structure", StructureFixAgent)
-AgentRegistry.register("verify", VerifierAgent)
-AgentRegistry.register("title", TitleAgent)
+# ==================== Self-Optimizing Pipeline ====================
 
-
-# ==================== Graph Workflow 定义 ====================
-
-def create_graph_workflow() -> DAGWorkflow:
+class SelfOptimizingPipeline:
     """
-    创建 Graph Workflow
-    支持条件路由和 Targeted Repair
-    """
-    dag = DAGWorkflow()
-
-    # 节点定义
-    dag.add_node(DAGNode(id="load", type=NodeType.AGENT, agent_name="clean"))
-    dag.add_node(DAGNode(id="analyze", type=NodeType.AGENT, agent_name="analyze"))
-    dag.add_node(DAGNode(id="plan", type=NodeType.AGENT, agent_name="plan"))
-    dag.add_node(DAGNode(id="generate", type=NodeType.AGENT, agent_name="generate"))
-
-    # 验证节点（带条件路由）
-    verify_node = DAGNode(
-        id="verify",
-        type=NodeType.AGENT,
-        agent_name="verify",
-        params={
-            "conditions": {
-                "score>=7.5": "title",
-                "score<7.5": "repair_dispatch"
-            }
-        }
-    )
-    dag.add_node(verify_node)
-
-    # 修复节点（可并行）
-    dag.add_node(DAGNode(id="fix_rhyme", type=NodeType.AGENT, agent_name="fix_rhyme"))
-    dag.add_node(DAGNode(id="boost_emotion", type=NodeType.AGENT, agent_name="boost_emotion"))
-    dag.add_node(DAGNode(id="fix_structure", type=NodeType.AGENT, agent_name="fix_structure"))
-
-    # 修复调度器（条件分支）
-    repair_node = DAGNode(
-        id="repair_dispatch",
-        type=NodeType.CONDITION,
-        params={
-            "conditions": {
-                "rhyme_score<7": "fix_rhyme",
-                "emotion_match<7": "boost_emotion",
-                "structure_score<7": "fix_structure"
-            }
-        }
-    )
-    dag.add_node(repair_node)
-
-    dag.add_node(DAGNode(id="title", type=NodeType.AGENT, agent_name="title"))
-    dag.add_node(DAGNode(id="output", type=NodeType.OUTPUT))
-
-    # 边定义
-    dag.add_edge("load", "analyze")
-    dag.add_edge("analyze", "plan")
-    dag.add_edge("plan", "generate")
-    dag.add_edge("generate", "verify")
-    dag.add_edge("verify", "title")
-    dag.add_edge("title", "output")
-
-    # 修复路径
-    dag.add_edge("fix_rhyme", "generate")
-    dag.add_edge("fix_structure", "generate")
-    dag.add_edge("boost_emotion", "generate")
-    dag.add_edge("repair_dispatch", "fix_rhyme")
-
-    return dag
-
-
-# ==================== 主 Pipeline ====================
-
-class LyricGraphPipeline:
-    """
-    Graph-based Multi-Agent Pipeline
-    可扩展、可插拔、精准修复
+    v5.0 核心：自优化 Pipeline
+    解决收敛性问题
     """
 
     def __init__(self, api_key: str, api_base: str, model_name: str):
@@ -851,130 +844,179 @@ class LyricGraphPipeline:
             model_name=model_name,
             temperature=0.8
         )
-        self.graph = create_graph_workflow()
+
+        # 核心组件
+        self.constraint_lock = ConstraintLock()
+        self.global_optimizer = GlobalOptimizer()
+        self.meta_agent = MetaAgent()
+        self.diff_editor = DiffEditor()
+
         self.genre = "流行"
-        self.max_repair_loops = 3
+        self.max_iterations = 5
 
     def run(self, chat_text: str, genre: str = "流行") -> Dict:
-        """执行 Graph Workflow"""
+        """执行自优化流程"""
         self.genre = genre
 
         context = {
             "raw_text": chat_text,
             "genre": genre,
-            "repair_count": 0
+            "iteration": 0,
+            "scores_history": []
         }
 
         print("\n" + "="*60)
-        print("🎵 WeChatChat2Lyric-Agent v4.0 (Graph-based Multi-Agent)")
+        print("🎵 WeChatChat2Lyric-Agent v5.0 (Self-Optimizing)")
         print("="*60)
-        print(f"📂 加载聊天记录: {len(chat_text)} 字符")
+        print(f"📂 聊天记录: {len(chat_text)} 字符")
         print(f"🎸 曲风: {genre}")
-        print("\n🔄 开始 Graph Workflow...\n")
+        print("\n🔄 开始自优化流程...\n")
 
-        # 手动执行（更精确控制）
-        result = self._execute_workflow(context)
+        # Phase 1: 生成
+        print("[Phase 1] 生成初始歌词...")
+        context = self._generation_phase(context)
 
-        return result
+        # Phase 2: 自优化
+        print("\n[Phase 2] 自优化循环...")
+        context = self._optimization_phase(context)
 
-    def _execute_workflow(self, context: Dict) -> Dict:
-        """执行工作流"""
-        iteration = 0
-        max_iterations = 20
-
-        while iteration < max_iterations:
-            iteration += 1
-
-            state = context.get("_current_state", "load")
-
-            if state == "load":
-                print("\n[Step 1] 清洗聊天记录...")
-                context["cleaned_text"] = CleanerAgent.execute(context)
-                print(f"   → 清洗完成: {len(context['cleaned_text'])} 字符")
-                context["_current_state"] = "analyze"
-
-            elif state == "analyze":
-                print("\n[Step 2] 分析情感...")
-                analysis = EmotionAnalystAgent.execute(context)
-                context.update(analysis)
-                print(f"   → 情感: {context.get('emotion', '未知')}")
-                print(f"   → 关键词: {', '.join(context.get('keywords', [])[:5])}")
-                context["_current_state"] = "plan"
-
-            elif state == "plan":
-                print("\n[Step 3] 规划歌词骨架...")
-                skeleton_data = SkeletonPlannerAgent.execute(context)
-                context["skeleton_plan"] = skeleton_data
-
-                sections = skeleton_data.get("sections", [])
-                print(f"   → 段落数: {len(sections)}")
-                for s in sections:
-                    print(f"   → [{s['section_type']}] {s['lines']}句 情感:{s['emotion']} 韵脚:{s['rhyme_end']}")
-
-                context["_current_state"] = "generate"
-
-            elif state == "generate":
-                print("\n[Step 4] 生成歌词...")
-                context["lyrics"] = GeneratorAgent.execute(context)
-                print(f"   → 生成完成: {len(context['lyrics'])} 字符")
-                context["_current_state"] = "verify"
-
-            elif state == "verify":
-                print("\n[Step 5] 质量审查...")
-                verification = VerifierAgent.execute(context)
-                context["verification"] = verification
-
-                print(f"   ⭐ 总分: {verification.get('overall', 0):.1f}/10")
-                print(f"   节奏感: {verification.get('rhythm_quality', 0):.1f}")
-                print(f"   情感匹配: {verification.get('emotion_match', 0):.1f}")
-                print(f"   结构合规: {verification.get('structure_compliance', 0):.1f}")
-                print(f"   押韵质量: {verification.get('rhyme_quality', 0):.1f}")
-
-                score = verification.get('overall', 0)
-                targeted = verification.get('targeted_repairs', {})
-
-                if score >= 7.5:
-                    print(f"   ✅ 质量达标")
-                    context["_current_state"] = "title"
-                else:
-                    context["repair_count"] = context.get("repair_count", 0) + 1
-                    if context["repair_count"] >= self.max_repair_loops:
-                        print(f"   ⚠️ 达到最大修复次数，跳过")
-                        context["_current_state"] = "title"
-                    else:
-                        print(f"   🔧 执行 Targeted Repair ({context['repair_count']}/{self.max_repair_loops})")
-                        self._execute_targeted_repair(context, verification)
-                        context["_current_state"] = "generate"
-
-            elif state == "title":
-                print("\n[Step 6] 生成标题...")
-                context["title"] = TitleAgent.execute(context)
-                print(f"   → 标题: {context['title']}")
-                context["_current_state"] = "done"
-
-            elif state == "done":
-                break
+        # Phase 3: 输出
+        print("\n[Phase 3] 生成标题...")
+        context["title"] = TitleAgent.execute(context)
 
         return self._build_result(context)
 
-    def _execute_targeted_repair(self, context: Dict, verification: Dict):
-        """执行精准修复"""
-        targeted = verification.get("targeted_repairs", {})
-        issues = verification.get("issues", [])
+    def _generation_phase(self, context: Dict) -> Dict:
+        """生成阶段"""
+        print("  [1.1] 清洗...")
+        context["cleaned_text"] = CleanerAgent.execute(context)
 
-        print(f"   📋 问题列表: {', '.join(issues[:3])}")
+        print("  [1.2] 分析情感...")
+        analysis = EmotionAnalystAgent.execute(context)
+        context.update(analysis)
+        print(f"       情感: {context.get('emotion', '未知')}")
 
-        if targeted.get("fix_rhyme"):
-            print("   → 修复押韵...")
-            context["lyrics"] = RhymeFixerAgent.execute(context)
+        print("  [1.3] 规划骨架...")
+        context["skeleton_plan"] = SkeletonPlannerAgent.execute(context)
 
-        if targeted.get("boost_emotion"):
-            print("   → 增强情感...")
-            context["lyrics"] = EmotionBoostAgent.execute(context)
+        print("  [1.4] 生成歌词...")
+        context["lyrics"] = GeneratorAgent.execute(context)
+        print(f"       生成: {len(context['lyrics'])} 字符")
 
-        if targeted.get("fix_structure"):
-            print("   → 修复结构...")
-            context["lyrics"] = StructureFixAgent.execute(context)
+        return context
+
+    def _optimization_phase(self, context: Dict) -> Dict:
+        """优化阶段 - 核心创新"""
+        iteration = 0
+
+        while iteration < self.max_iterations:
+            iteration += 1
+            context["iteration"] = iteration
+
+            print(f"\n  --- 优化循环 {iteration}/{self.max_iterations} ---")
+
+            # 验证
+            print("  [验证] 质量审查...")
+            verification = VerifierAgent.execute(context)
+            scores = {
+                "rhythm_quality": verification.get("rhythm_quality", 0),
+                "emotion_match": verification.get("emotion_match", 0),
+                "structure_compliance": verification.get("structure_compliance", 0),
+                "rhyme_quality": verification.get("rhyme_quality", 0),
+                "keyword_coverage": verification.get("keyword_coverage", 0)
+            }
+            context["verification"] = verification
+
+            global_score = self.global_optimizer.compute_global_score(scores)
+            print(f"       全局分数: {global_score:.2f}/10")
+
+            # 约束锁定
+            locked = self.constraint_lock.evaluate_and_lock(scores)
+            print(f"       {self.constraint_lock.get_lock_report()}")
+
+            # 记录历史
+            self.global_optimizer.record_iteration(scores, "verify")
+
+            # 检查收敛
+            should_continue, reason = self.global_optimizer.should_continue_optimizing(
+                scores, iteration, self.max_iterations
+            )
+
+            if not should_continue:
+                print(f"       ✅ {reason}")
+                break
+
+            # Targeted Repair
+            targeted = verification.get("targeted_repairs", {})
+            issues = verification.get("issues", [])
+
+            if not any(targeted.values()):
+                print("       ✅ 无需修复")
+                break
+
+            print(f"       🔧 执行精准修复...")
+            print(f"       📋 问题: {', '.join(issues[:2])}")
+
+            # Meta-Agent 决策
+            for dim, needs_fix in targeted.items():
+                if not needs_fix:
+                    continue
+
+                # 检查是否跳过
+                skip, skip_reason = self.meta_agent.should_skip_repair(
+                    f"fix_{dim}" if dim != "emotion" else "boost_emotion",
+                    scores,
+                    locked
+                )
+
+                if skip:
+                    print(f"       ⏭️  跳过 {dim}: {skip_reason}")
+                    continue
+
+                # 执行修复
+                print(f"       → 修复 {dim}...")
+                scores_before = scores.copy()
+
+                # 差分编辑
+                edit_plan = self.diff_editor.generate_targeted_edit_plan(
+                    context["lyrics"], issues, locked
+                )
+
+                if edit_plan:
+                    context["edit_plan"] = edit_plan
+                    context["lyrics"] = DiffEditAgent.execute(context)
+                else:
+                    # 回退到整段重生成（不得已）
+                    context["lyrics"] = GeneratorAgent.execute(context)
+
+                # 重新验证
+                verification_new = VerifierAgent.execute(context)
+                scores_new = {
+                    "rhythm_quality": verification_new.get("rhythm_quality", 0),
+                    "emotion_match": verification_new.get("emotion_match", 0),
+                    "structure_compliance": verification_new.get("structure_compliance", 0),
+                    "rhyme_quality": verification_new.get("rhyme_quality", 0),
+                    "keyword_coverage": verification_new.get("keyword_coverage", 0)
+                }
+
+                # Meta-Agent 学习
+                self.meta_agent.analyze_repair_outcome(
+                    f"fix_{dim}",
+                    scores_before,
+                    scores_new,
+                    dim
+                )
+
+                self.global_optimizer.record_iteration(scores_new, f"fix_{dim}")
+
+                # 更新分数
+                context["verification"] = verification_new
+                scores = scores_new
+
+            # 约束重评估
+            locked = self.constraint_lock.evaluate_and_lock(scores)
+
+        return context
 
     def _build_result(self, context: Dict) -> Dict:
         """构建结果"""
@@ -995,7 +1037,7 @@ class LyricGraphPipeline:
         print("\n" + "="*60)
         print("🎵 歌曲标题:", result["title"])
         print("🎸 曲风:", result["genre"])
-        print("🎧 情感:", result["emotion"], "-", result["emotion_detail"])
+        print("🎧 情感:", result["emotion"])
         print("🔑 关键词:", ", ".join(result["keywords"][:6]))
 
         qs = result.get("quality_score", {})
@@ -1008,34 +1050,13 @@ class LyricGraphPipeline:
         print(result["lyrics"])
         print("-"*40)
 
-    def save_result(self, result: Dict, file_path: str) -> bool:
-        """保存结果"""
-        content = f"""🎵 歌曲标题: {result['title']}
-🎸 曲风: {result['genre']}
-🎧 情感类型: {result['emotion']}
-🔑 关键词: {', '.join(result['keywords'])}
-
-{'='*50}
-📝 歌词:
-{'='*50}
-
-{result['lyrics']}
-"""
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            print(f"✅ 已保存到: {file_path}")
-            return True
-        except:
-            return False
-
 
 # ==================== 演示 ====================
 
 def run_demo():
-    """运行演示"""
+    """演示"""
     print("\n" + "="*60)
-    print("🎵 WeChatChat2Lyric-Agent v4.0 演示")
+    print("🎵 WeChatChat2Lyric-Agent v5.0 演示")
     print("="*60)
 
     demo_chat = """2024/1/1 12:00:00
@@ -1059,7 +1080,7 @@ def run_demo():
     print("\n📝 示例聊天记录（情侣甜蜜对话）:\n")
     print(demo_chat[:200] + "...\n")
 
-    pipeline = LyricGraphPipeline(API_KEY, API_BASE, MODEL_NAME)
+    pipeline = SelfOptimizingPipeline(API_KEY, API_BASE, MODEL_NAME)
     result = pipeline.run(demo_chat, "流行")
     pipeline.print_result(result)
 
@@ -1069,28 +1090,29 @@ def run_demo():
 # ==================== 命令行 ====================
 
 def interactive_mode():
-    """交互式界面"""
+    """交互界面"""
     print("""
 ╔══════════════════════════════════════════════════════════╗
 ║                                                          ║
-║        🎵 WeChatChat2Lyric-Agent v4.0 🎵                ║
+║        🎵 WeChatChat2Lyric-Agent v5.0 🎵                ║
 ║                                                          ║
-║     Graph-based Multi-Agent + Targeted Repair Loop      ║
+║     Self-Optimizing Agent System                         ║
+║     Global Constraint + Diff Edit + Meta-Agent           ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
     """)
 
-    print("\n🎯 操作选项：")
+    print("\n🎯 选项：")
     print("  1. 从文件加载")
-    print("  2. 直接输入聊天记录")
-    print("  3. 运行示例演示")
+    print("  2. 直接输入")
+    print("  3. 演示")
     print("  0. 退出")
 
     choice = input("\n请输入: ").strip()
 
     if choice == "1":
         file_path = input("文件路径: ").strip()
-        genre = input("曲风 (1流行/2民谣/3说唱/4抒情/5摇滚，默认1): ").strip()
+        genre = input("曲风 (1流行/2民谣/3说唱/4抒情/5摇滚): ").strip()
         genre_map = {"1": "流行", "2": "民谣", "3": "说唱", "4": "抒情", "5": "摇滚"}
         genre = genre_map.get(genre, "流行")
 
@@ -1098,14 +1120,16 @@ def interactive_mode():
             with open(file_path, 'r', encoding='utf-8') as f:
                 chat_text = f.read()
 
-            pipeline = LyricGraphPipeline(API_KEY, API_BASE, MODEL_NAME)
+            pipeline = SelfOptimizingPipeline(API_KEY, API_BASE, MODEL_NAME)
             result = pipeline.run(chat_text, genre)
             pipeline.print_result(result)
 
             if input("\n保存？(y/n): ").strip().lower() == 'y':
                 save_path = input("路径: ").strip()
                 if save_path:
-                    pipeline.save_result(result, save_path)
+                    with open(save_path, 'w', encoding='utf-8') as f:
+                        f.write(f"🎵 {result['title']}\n\n{result['lyrics']}")
+                    print(f"✅ 已保存")
         except Exception as e:
             print(f"❌ 错误: {e}")
 
@@ -1121,12 +1145,8 @@ def interactive_mode():
             except:
                 break
 
-        genre = input("曲风 (1流行/2民谣/3说唱/4抒情/5摇滚，默认1): ").strip()
-        genre_map = {"1": "流行", "2": "民谣", "3": "说唱", "4": "抒情", "5": "摇滚"}
-        genre = genre_map.get(genre, "流行")
-
-        pipeline = LyricGraphPipeline(API_KEY, API_BASE, MODEL_NAME)
-        result = pipeline.run('\n'.join(lines), genre)
+        pipeline = SelfOptimizingPipeline(API_KEY, API_BASE, MODEL_NAME)
+        result = pipeline.run('\n'.join(lines), "流行")
         pipeline.print_result(result)
 
     elif choice == "3":
@@ -1144,9 +1164,9 @@ if __name__ == "__main__":
             run_demo()
         elif sys.argv[1] == "--help":
             print("""
-使用：python chat2lyric_agent.py              # 交互
-     python chat2lyric_agent.py --demo      # 演示
-     python chat2lyric_agent.py <file> [genre]  # 文件
+使用：python chat2lyric_agent.py
+     python chat2lyric_agent.py --demo
+     python chat2lyric_agent.py <file> [genre]
             """)
         else:
             file_path = sys.argv[1]
@@ -1156,7 +1176,7 @@ if __name__ == "__main__":
                 with open(file_path, 'r', encoding='utf-8') as f:
                     chat_text = f.read()
 
-                pipeline = LyricGraphPipeline(API_KEY, API_BASE, MODEL_NAME)
+                pipeline = SelfOptimizingPipeline(API_KEY, API_BASE, MODEL_NAME)
                 result = pipeline.run(chat_text, genre)
                 pipeline.print_result(result)
             except Exception as e:
