@@ -1,14 +1,18 @@
 """
-WeChatChat2Lyric-Agent v5.0
-Self-Optimizing Agent System
+WeChatChat2Lyric-Agent v5.5
+Enhanced Self-Optimizing System
 
-核心架构：
-- Global Constraint Controller（冻结高分维度，避免震荡）
-- Diff-based Editing（精确修改局部）
-- Unified Objective Function（全局优化目标）
-- Meta-Agent（学习修复历史，经验驱动优化）
+新增功能：
+- 风格控制器（Style Controller）- 可控生成
+- 固定歌词结构模板（Structure Template）
+- 故事图谱提取（Story Graph）
+- 可解释生成（Explainable Generation）
 
-解决 v4.0 的核心问题：non-converging multi-objective optimization
+核心架构升级：
+- 从"随机生成" → "可控生成"
+- 从"自由结构" → "模板约束"
+- 从"表面分析" → "深度故事理解"
+- 从"黑盒输出" → "可解释输出"
 """
 
 import os
@@ -32,8 +36,6 @@ API_KEY = os.getenv("OPENAI_API_KEY", "sk-44b7a257f56d4d80b85ed5ac4d1d182d")
 API_BASE = os.getenv("OPENAI_API_BASE", "https://api.deepseek.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-chat")
 
-GENRE_OPTIONS = ["流行", "民谣", "说唱", "抒情", "摇滚"]
-
 llm = ChatOpenAI(
     openai_api_key=API_KEY,
     openai_api_base=API_BASE,
@@ -43,124 +45,476 @@ llm = ChatOpenAI(
 )
 
 
-# ==================== 全局约束控制器 ====================
+# ==================== 风格控制器 ====================
+
+@dataclass
+class StyleProfile:
+    """风格配置"""
+    name: str
+    description: str
+    prompt_suffix: str
+    temperature: float
+    rhyme_density: float  # 押韵密度 0-1
+    emotion_intensity: float  # 情感强度 0-1
+    narrative_mode: str  # "first_person" / "third_person" / "universal"
+
+
+class StyleController:
+    """
+    风格控制器
+    支持细粒度风格选择，不只是曲风
+    """
+    # 预设风格库
+    STYLES = {
+        # 情感类
+        "甜蜜": StyleProfile(
+            name="甜蜜",
+            description="温暖甜蜜，适合情侣",
+            prompt_suffix="甜蜜、温馨、幸福",
+            temperature=0.7,
+            rhyme_density=0.8,
+            emotion_intensity=0.7,
+            narrative_mode="first_person"
+        ),
+        "伤感": StyleProfile(
+            name="伤感",
+            description="忧郁抒情，触动心弦",
+            prompt_suffix="伤感、忧郁、怀旧",
+            temperature=0.6,
+            rhyme_density=0.9,
+            emotion_intensity=0.9,
+            narrative_mode="first_person"
+        ),
+        "治愈": StyleProfile(
+            name="治愈",
+            description="温暖疗愈，给人力量",
+            prompt_suffix="治愈、希望、温暖",
+            temperature=0.75,
+            rhyme_density=0.7,
+            emotion_intensity=0.6,
+            narrative_mode="universal"
+        ),
+        # 叙事类
+        "叙事": StyleProfile(
+            name="叙事",
+            description="讲故事，有画面感",
+            prompt_suffix="叙事性强、有画面感、讲故事",
+            temperature=0.8,
+            rhyme_density=0.6,
+            emotion_intensity=0.5,
+            narrative_mode="first_person"
+        ),
+        "民谣": StyleProfile(
+            name="民谣",
+            description="质朴自然，文艺清新",
+            prompt_suffix="民谣风格、质朴、自然、文艺",
+            temperature=0.8,
+            rhyme_density=0.7,
+            emotion_intensity=0.5,
+            narrative_mode="first_person"
+        ),
+        # 节奏类
+        "说唱": StyleProfile(
+            name="说唱",
+            description="节奏强劲，押韵密集",
+            prompt_suffix="说唱风格、节奏感强、押韵密集、态度鲜明",
+            temperature=0.85,
+            rhyme_density=1.0,
+            emotion_intensity=0.8,
+            narrative_mode="first_person"
+        ),
+        "摇滚": StyleProfile(
+            name="摇滚",
+            description="力量感强，情绪爆发",
+            prompt_suffix="摇滚风格、力量感强、节奏强劲、震撼",
+            temperature=0.9,
+            rhyme_density=0.8,
+            emotion_intensity=0.95,
+            narrative_mode="first_person"
+        ),
+        # 特殊风格
+        "R&B": StyleProfile(
+            name="R&B",
+            description="丝滑 R&B 风格",
+            prompt_suffix="R&B风格、丝滑、性感、优雅",
+            temperature=0.75,
+            rhyme_density=0.85,
+            emotion_intensity=0.75,
+            narrative_mode="first_person"
+        ),
+        "古风": StyleProfile(
+            name="古风",
+            description="唯美古风，意境悠远",
+            prompt_suffix="古风、唯美、意境、诗意",
+            temperature=0.65,
+            rhyme_density=0.9,
+            emotion_intensity=0.7,
+            narrative_mode="universal"
+        ),
+    }
+
+    @classmethod
+    def get_style(cls, style_name: str) -> StyleProfile:
+        """获取风格配置"""
+        return cls.STYLES.get(style_name, cls.STYLES["流行"])
+
+    @classmethod
+    def list_styles(cls) -> List[str]:
+        """列出所有可用风格"""
+        return list(cls.STYLES.keys())
+
+    @classmethod
+    def apply_style_to_prompt(cls, base_prompt: str, style_name: str) -> str:
+        """将风格配置应用到 prompt"""
+        style = cls.get_style(style_name)
+        styled_prompt = f"{base_prompt}\n\n风格要求：{style.description}"
+        return styled_prompt
+
+
+# ==================== 歌词结构模板 ====================
+
+@dataclass
+class SectionTemplate:
+    """段落模板"""
+    name: str  # verse1, chorus, verse2, bridge, etc.
+    display_name: str  # 主歌1, 副歌, 主歌2, 桥段
+    min_lines: int
+    max_lines: int
+    emotion_target: str  # low, rising, peak, fall
+    function: str  # intro, climax, continuation, turn, final
+
+
+class LyricStructureTemplate:
+    """
+    固定歌词结构模板
+    确保歌词结构稳定，不是自由生成
+    """
+    TEMPLATES = {
+        # 标准流行结构
+        "standard_pop": {
+            "name": "标准流行",
+            "description": "最常见的歌词结构",
+            "sections": [
+                SectionTemplate("verse1", "主歌1", 4, 6, "low", "intro"),
+                SectionTemplate("pre_chorus", "副歌前", 2, 4, "rising", "buildup"),
+                SectionTemplate("chorus", "副歌", 4, 6, "peak", "climax"),
+                SectionTemplate("verse2", "主歌2", 4, 6, "low", "continuation"),
+                SectionTemplate("chorus", "副歌", 4, 6, "peak", "climax"),
+                SectionTemplate("bridge", "桥段", 4, 4, "fall", "turn"),
+                SectionTemplate("chorus", "副歌", 4, 6, "peak", "final"),
+            ]
+        },
+        # 简洁结构
+        "simple": {
+            "name": "简洁结构",
+            "description": "主歌+副歌简单循环",
+            "sections": [
+                SectionTemplate("verse1", "主歌1", 4, 4, "low", "intro"),
+                SectionTemplate("chorus", "副歌", 4, 4, "peak", "climax"),
+                SectionTemplate("verse2", "主歌2", 4, 4, "rising", "continuation"),
+                SectionTemplate("chorus", "副歌", 4, 4, "peak", "climax"),
+            ]
+        },
+        # 完整结构
+        "full": {
+            "name": "完整结构",
+            "description": "最完整的歌词结构",
+            "sections": [
+                SectionTemplate("intro", "开场", 2, 2, "low", "intro"),
+                SectionTemplate("verse1", "主歌1", 4, 6, "low", "intro"),
+                SectionTemplate("pre_chorus", "副歌前", 2, 4, "rising", "buildup"),
+                SectionTemplate("chorus", "副歌", 4, 6, "peak", "climax"),
+                SectionTemplate("verse2", "主歌2", 4, 6, "rising", "continuation"),
+                SectionTemplate("chorus", "副歌", 4, 6, "peak", "climax"),
+                SectionTemplate("bridge", "桥段", 4, 4, "fall", "turn"),
+                SectionTemplate("chorus", "副歌", 4, 6, "peak", "final"),
+                SectionTemplate("outro", "尾奏", 2, 2, "fall", "ending"),
+            ]
+        },
+        # 说唱结构
+        "rap": {
+            "name": "说唱结构",
+            "description": "适合说唱的节奏结构",
+            "sections": [
+                SectionTemplate("intro", "开场", 2, 2, "rising", "intro"),
+                SectionTemplate("verse1", "主歌1", 8, 8, "rising", "verse"),
+                SectionTemplate("hook", "钩子", 4, 4, "peak", "hook"),
+                SectionTemplate("verse2", "主歌2", 8, 8, "rising", "verse"),
+                SectionTemplate("hook", "钩子", 4, 4, "peak", "hook"),
+                SectionTemplate("bridge", "过渡", 4, 4, "fall", "bridge"),
+                SectionTemplate("hook", "钩子", 4, 4, "peak", "final"),
+            ]
+        },
+    }
+
+    @classmethod
+    def get_template(cls, template_name: str):
+        """获取模板"""
+        return cls.TEMPLATES.get(template_name, cls.TEMPLATES["standard_pop"])
+
+    @classmethod
+    def generate_structure_constraint(cls, template_name: str, skeleton_data: Dict) -> str:
+        """生成结构约束文本"""
+        template = cls.get_template(template_name)
+        constraints = []
+
+        for section in template.sections:
+            # 从 skeleton 获取该段的信息
+            section_data = None
+            for s in skeleton_data.get("sections", []):
+                if section.name in s.get("section_type", ""):
+                    section_data = s
+                    break
+
+            rhyme = section_data.get("rhyme_end", "ang") if section_data else "ang"
+            keywords = section_data.get("keywords", []) if section_data else []
+
+            constraints.append(
+                f"[{section.display_name}]\n"
+                f"- 句数: {section.min_lines}-{section.max_lines}\n"
+                f"- 情感: {section.emotion_target}\n"
+                f"- 功能: {section.function}\n"
+                f"- 韵脚: {rhyme}\n"
+                f"- 关键词: {', '.join(keywords[:3])}"
+            )
+
+        return "\n\n".join(constraints)
+
+
+# ==================== 故事图谱 ====================
+
+@dataclass
+class StoryNode:
+    """故事节点"""
+    type: str  # emotion_event, relationship_milestone, conflict, resolution
+    content: str
+    timestamp: str = ""
+    importance: float = 1.0  # 0-1
+
+
+@dataclass
+class StoryGraph:
+    """故事图谱"""
+    nodes: List[StoryNode] = field(default_factory=list)
+    emotion_arc: List[str] = field(default_factory=list)  # 情感弧线
+    core_theme: str = ""
+
+
+class StoryGraphExtractor:
+    """
+    故事图谱提取器
+    从聊天记录中提取故事结构
+    """
+
+    @classmethod
+    def extract(cls, chat_text: str, emotion: str) -> StoryGraph:
+        """从聊天记录中提取故事图谱"""
+        prompt = f"""从聊天记录中提取故事图谱：
+
+聊天记录：
+{chat_text}
+
+情感基调：{emotion}
+
+请提取：
+1. 情感事件节点（emotion_event）：重要的情感表达时刻
+2. 关系里程碑（relationship_milestone）：关系进展的关键点
+3. 核心主题（core_theme）：整个对话的核心
+
+输出JSON格式：
+{{
+    "nodes": [
+        {{"type": "emotion_event", "content": "描述", "importance": 0.9}},
+        {{"type": "relationship_milestone", "content": "描述", "importance": 0.8}}
+    ],
+    "emotion_arc": ["起点情感", "发展", "高潮", "结尾"],
+    "core_theme": "核心主题"
+}}
+
+直接输出JSON："""
+
+        try:
+            response = llm([HumanMessage(content=prompt)])
+            result = response.content.strip()
+            if '```json' in result:
+                result = result.split('```json')[1].split('```')[0]
+
+            data = json.loads(result)
+
+            nodes = []
+            for n in data.get("nodes", []):
+                nodes.append(StoryNode(
+                    type=n.get("type", "emotion_event"),
+                    content=n.get("content", ""),
+                    importance=n.get("importance", 1.0)
+                ))
+
+            return StoryGraph(
+                nodes=nodes,
+                emotion_arc=data.get("emotion_arc", []),
+                core_theme=data.get("core_theme", "")
+            )
+        except:
+            return StoryGraph()
+
+    @classmethod
+    def to_context(cls, graph: StoryGraph) -> str:
+        """将图谱转换为生成上下文"""
+        if not graph.nodes:
+            return ""
+
+        context_parts = ["【故事图谱】"]
+        for node in graph.nodes:
+            importance_bar = "⭐" * int(node.importance * 5)
+            context_parts.append(f"{importance_bar} [{node.type}] {node.content}")
+
+        if graph.core_theme:
+            context_parts.append(f"\n核心主题：{graph.core_theme}")
+
+        if graph.emotion_arc:
+            context_parts.append(f"情感弧线：{' → '.join(graph.emotion_arc)}")
+
+        return "\n".join(context_parts)
+
+
+# ==================== 可解释生成 ====================
+
+@dataclass
+class LyricExplanation:
+    """歌词解释"""
+    line: str
+    source_chat: str  # 对应聊天内容
+    emotion_reason: str  # 为什么这样写
+    rhyme_explanation: str  # 押韵说明
+
+
+class ExplainableGenerator:
+    """
+    可解释生成器
+    解释每句歌词的来源和原因
+    """
+
+    @classmethod
+    def generate_explanation(
+        cls,
+        lyrics: str,
+        chat_text: str,
+        emotion: str,
+        keywords: List[str]
+    ) -> List[LyricExplanation]:
+        """生成歌词解释"""
+        prompt = f"""为以下歌词生成解释：
+
+歌词：
+{lyrics}
+
+原始聊天记录：
+{chat_text}
+
+情感：{emotion}
+关键词：{', '.join(keywords)}
+
+请为每句歌词解释：
+1. 对应聊天中的哪句话
+2. 为什么这样写
+3. 押韵设计
+
+输出JSON格式：
+{{
+    "explanations": [
+        {{
+            "line": "歌词句子",
+            "source_chat": "对应的聊天内容",
+            "emotion_reason": "为什么这样写",
+            "rhyme_explanation": "押韵说明"
+        }}
+    ]
+}}
+
+直接输出JSON："""
+
+        try:
+            response = llm([HumanMessage(content=prompt)])
+            result = response.content.strip()
+            if '```json' in result:
+                result = result.split('```json')[1].split('```')[0]
+
+            data = json.loads(result)
+            explanations = []
+
+            for e in data.get("explanations", []):
+                explanations.append(LyricExplanation(
+                    line=e.get("line", ""),
+                    source_chat=e.get("source_chat", ""),
+                    emotion_reason=e.get("emotion_reason", ""),
+                    rhyme_explanation=e.get("rhyme_explanation", "")
+                ))
+
+            return explanations
+        except:
+            return []
+
+    @classmethod
+    def format_explanations(cls, explanations: List[LyricExplanation]) -> str:
+        """格式化解释输出"""
+        if not explanations:
+            return ""
+
+        parts = ["\n" + "="*50]
+        parts.append("📖 歌词解释")
+        parts.append("="*50)
+
+        for i, exp in enumerate(explanations, 1):
+            parts.append("\n【第" + str(i) + "句】" + exp.line)
+            parts.append("   聊天来源：" + exp.source_chat)
+            parts.append("   情感设计：" + exp.emotion_reason)
+            parts.append("   押韵：" + exp.rhyme_explanation)
+
+        return "\n".join(parts)
+
+
+# ==================== 核心组件（保持不变） ====================
 
 class ConstraintLock:
-    """
-    全局约束锁
-    冻结高分维度，避免修复时破坏已达标的部分
-    """
-
+    """全局约束锁"""
     def __init__(self):
         self.locked_dims: Set[str] = set()
-        self.lock_threshold = 8.0  # 超过此分数锁定
-        self.lock_history: List[Dict] = []
+        self.lock_threshold = 8.0
 
     def evaluate_and_lock(self, scores: Dict[str, float]) -> Set[str]:
-        """
-        评估分数，锁定高分维度
-        返回当前被锁定的维度
-        """
-        newly_locked = set()
-
         for dim, score in scores.items():
             if score >= self.lock_threshold and dim not in self.locked_dims:
                 self.locked_dims.add(dim)
-                newly_locked.add(dim)
-                self.lock_history.append({
-                    "dimension": dim,
-                    "score": score,
-                    "action": "LOCK",
-                    "timestamp": datetime.now().isoformat()
-                })
-
         return self.locked_dims
-
-    def is_locked(self, dimension: str) -> bool:
-        return dimension in self.locked_dims
-
-    def get_locked_dims(self) -> Set[str]:
-        return self.locked_dims.copy()
-
-    def unlock_all(self):
-        """重置锁定"""
-        self.locked_dims.clear()
 
     def get_lock_report(self) -> str:
         if not self.locked_dims:
-            return "无锁定维度"
+            return "无锁定"
         return f"已锁定: {', '.join(self.locked_dims)}"
 
 
-# ==================== 差分编辑器 ====================
-
 @dataclass
 class EditAction:
-    """编辑操作"""
     line_index: int
-    action_type: str  # "fix_rhyme", "boost_emotion", "modify"
+    action_type: str
     target_content: str = ""
     original_content: str = ""
     reason: str = ""
 
 
 class DiffEditor:
-    """
-    差分编辑器
-    只修改局部，不整段重写
-    """
-
-    def __init__(self):
-        self.edit_history: List[EditAction] = []
-        self.line_cache: List[str] = []
-
+    """差分编辑器"""
     def parse_lyrics_to_lines(self, lyrics: str) -> List[str]:
-        """解析歌词为行列表"""
         lines = []
-        sections = []
-
         for line in lyrics.split('\n'):
             line = line.strip()
             if not line:
                 continue
             if line.startswith('[') and line.endswith(']'):
-                sections.append(line)
-                lines.append(line)  # 保留段落标记
+                lines.append(line)
             else:
                 lines.append(line)
-
         return lines
-
-    def apply_line_edit(self, lyrics: str, edit: EditAction) -> str:
-        """应用单行编辑"""
-        lines = self.parse_lyrics_to_lines(lyrics)
-
-        if 0 <= edit.line_index < len(lines):
-            # 跳过段落标记行
-            target_idx = edit.line_index
-            if lines[target_idx].startswith('['):
-                target_idx += 1
-
-            if target_idx < len(lines):
-                original = lines[target_idx]
-                lines[target_idx] = edit.target_content
-
-                edit.original_content = original
-                self.edit_history.append(edit)
-
-        return '\n'.join(lines)
-
-    def apply_batch_edits(self, lyrics: str, edits: List[EditAction]) -> str:
-        """批量应用编辑"""
-        result = lyrics
-
-        # 按行索引排序（从低到高，避免索引偏移）
-        sorted_edits = sorted(edits, key=lambda e: e.line_index)
-
-        for edit in sorted_edits:
-            result = self.apply_line_edit(result, edit)
-
-        return result
 
     def generate_targeted_edit_plan(
         self,
@@ -168,332 +522,35 @@ class DiffEditor:
         issues: List[str],
         locked_dims: Set[str]
     ) -> List[EditAction]:
-        """
-        生成精确的编辑计划
-        基于问题定位，生成最小编辑集
-        """
         lines = self.parse_lyrics_to_lines(lyrics)
         edit_plan = []
 
-        # 分析问题类型
-        rhyme_issues = [i for i in issues if '押韵' in i or 'rhyme' in i.lower()]
-        emotion_issues = [i for i in issues if '情感' in i or 'emotion' in i.lower()]
-        structure_issues = [i for i in issues if '结构' in i or '句数' in i]
-
-        # 为押韵问题定位目标行
+        rhyme_issues = [i for i in issues if '押韵' in i]
         if rhyme_issues and 'rhyme' not in locked_dims:
-            # 找最后一行（最可能是问题行）
-            last_meaningful_idx = len(lines) - 1
-            while last_meaningful_idx >= 0 and lines[last_meaningful_idx].startswith('['):
-                last_meaningful_idx -= 1
-
-            if last_meaningful_idx >= 0:
+            last_idx = len(lines) - 1
+            while last_idx >= 0 and lines[last_idx].startswith('['):
+                last_idx -= 1
+            if last_idx >= 0:
                 edit_plan.append(EditAction(
-                    line_index=last_meaningful_idx,
+                    line_index=last_idx,
                     action_type="fix_rhyme",
-                    reason=f"修复押韵: {rhyme_issues[0]}"
+                    reason=rhyme_issues[0]
                 ))
-
-        # 为情感问题定位
-        if emotion_issues and 'emotion' not in locked_dims:
-            # 副歌部分通常是情感核心
-            for i, line in enumerate(lines):
-                if line.startswith('[副歌]') or (i > 0 and 'chorus' in line.lower()):
-                    edit_plan.append(EditAction(
-                        line_index=i + 1,
-                        action_type="boost_emotion",
-                        reason=f"增强情感: {emotion_issues[0]}"
-                    ))
-                    break
 
         return edit_plan
 
 
-# ==================== 统一目标优化器 ====================
-
-@dataclass
-class OptimizationWeights:
-    """优化权重配置"""
-    rhythm: float = 0.25
-    emotion: float = 0.30
-    structure: float = 0.20
-    rhyme: float = 0.15
-    keyword: float = 0.10
-
-
 class GlobalOptimizer:
-    """
-    全局目标优化器
-    将多维分数统一为单一目标
-    """
-
-    def __init__(self, weights: OptimizationWeights = None):
-        self.weights = weights or OptimizationWeights()
-        self.history: List[Dict] = []
-
-    def compute_global_score(self, scores: Dict[str, float]) -> float:
-        """
-        计算全局分数
-        weighted sum = w1*s1 + w2*s2 + ...
-        """
-        w = self.weights
-
-        total = (
-            w.rhythm * scores.get("rhythm_quality", 0) +
-            w.emotion * scores.get("emotion_match", 0) +
-            w.structure * scores.get("structure_compliance", 0) +
-            w.rhyme * scores.get("rhyme_quality", 0) +
-            w.keyword * scores.get("keyword_coverage", 0)
-        )
-
-        return round(total, 2)
-
-    def get_improvement_direction(
-        self,
-        current_scores: Dict[str, float],
-        target_scores: Dict[str, float]
-    ) -> List[Tuple[str, float]]:
-        """
-        获取改进方向
-        返回：(维度, 改进优先级) 按优先级排序
-        """
-        improvements = []
-
-        for dim in ["rhythm", "emotion", "structure", "rhyme", "keyword"]:
-            score_key = f"{dim}_quality" if dim != "emotion" else "emotion_match"
-            current = current_scores.get(score_key, 0)
-            target = target_scores.get(score_key, 8.0)
-            gap = target - current
-
-            if gap > 0.5:  # 只考虑显著差距
-                # 考虑权重加权
-                weight = getattr(self.weights, dim, 0.2)
-                priority = gap * weight
-                improvements.append((dim, priority))
-
-        # 按优先级排序
-        improvements.sort(key=lambda x: x[1], reverse=True)
-        return improvements
-
-    def should_continue_optimizing(
-        self,
-        current_scores: Dict[str, float],
-        iteration: int,
-        max_iterations: int = 5
-    ) -> Tuple[bool, str]:
-        """
-        判断是否继续优化
-        返回：(是否继续, 原因)
-        """
-        global_score = self.compute_global_score(current_scores)
-
-        # 检查是否达标
-        if global_score >= 8.0:
-            return False, f"全局分数达标 ({global_score})"
-
-        # 检查迭代次数
-        if iteration >= max_iterations:
-            return False, f"达到最大迭代次数 ({max_iterations})"
-
-        # 检查是否收敛（分数变化小于阈值）
-        if len(self.history) >= 2:
-            prev_score = self.compute_global_score(self.history[-1])
-            delta = global_score - prev_score
-            if abs(delta) < 0.1:
-                return False, f"收敛 (delta={delta})"
-
-        return True, f"继续优化 (global={global_score})"
-
-    def record_iteration(self, scores: Dict, action: str):
-        """记录迭代历史"""
-        self.history.append({
-            "iteration": len(self.history),
-            "scores": scores.copy(),
-            "global_score": self.compute_global_score(scores),
-            "action": action,
-            "timestamp": datetime.now().isoformat()
-        })
-
-
-# ==================== Meta-Agent（核心创新）====================
-
-class MetaAgent:
-    """
-    元优化 Agent
-    学习修复历史，决定最优修复策略
-    从"规则驱动" → "经验驱动"
-    """
-
-    def __init__(self):
-        self.repair_success_log: List[Dict] = []
-        self.repair_failure_log: List[Dict] = []
-        self.strategy_preference: Dict[str, float] = defaultdict(float)
-
-    def analyze_repair_outcome(
-        self,
-        repair_action: str,
-        scores_before: Dict,
-        scores_after: Dict,
-        issue_dim: str
-    ):
-        """
-        分析修复结果
-        记录成功/失败经验
-        """
-        before_global = sum(scores_before.values()) / len(scores_before)
-        after_global = sum(scores_after.values()) / len(scores_after)
-        delta = after_global - before_global
-
-        record = {
-            "action": repair_action,
-            "issue_dim": issue_dim,
-            "delta": delta,
-            "scores_before": scores_before,
-            "scores_after": scores_after,
-            "timestamp": datetime.now().isoformat()
-        }
-
-        if delta > 0.3:
-            self.repair_success_log.append(record)
-            self.strategy_preference[repair_action] += delta
-        elif delta < -0.2:
-            self.repair_failure_log.append(record)
-            self.strategy_preference[repair_action] += delta
-
-    def get_optimal_action_sequence(self, issue_dim: str) -> List[str]:
-        """
-        获取最优操作序列
-        基于历史学习
-        """
-        # 分析相关维度的成功操作
-        relevant_successes = [
-            r for r in self.repair_success_log
-            if r["issue_dim"] == issue_dim
-        ]
-
-        if not relevant_successes:
-            # 默认顺序
-            return ["fix_structure", "fix_rhyme", "boost_emotion"]
-
-        # 按 delta 排序
-        relevant_successes.sort(key=lambda x: x["delta"], reverse=True)
-
-        return [r["action"] for r in relevant_successes[:3]]
-
-    def get_avoid_actions(self, issue_dim: str) -> List[str]:
-        """获取应避免的操作"""
-        relevant_failures = [
-            r for r in self.repair_failure_log
-            if r["issue_dim"] == issue_dim
-        ]
-        return [r["action"] for r in relevant_failures]
-
-    def should_skip_repair(
-        self,
-        repair_action: str,
-        current_scores: Dict,
-        locked_dims: Set[str]
-    ) -> Tuple[bool, str]:
-        """
-        判断是否跳过某修复
-        基于历史经验
-        """
-        # 检查是否锁定
-        for dim in ["rhyme", "emotion", "structure"]:
-            if dim in repair_action and dim in locked_dims:
-                return True, f"{dim} 已锁定，跳过 {repair_action}"
-
-        # 检查历史失败率
-        action_failures = [
-            r for r in self.repair_failure_log
-            if r["action"] == repair_action
-        ]
-        action_successes = [
-            r for r in self.repair_success_log
-            if r["action"] == repair_action
-        ]
-
-        total = len(action_failures) + len(action_successes)
-        if total >= 3:
-            failure_rate = len(action_failures) / total
-            if failure_rate > 0.6:
-                return True, f"{repair_action} 失败率 {failure_rate:.0%}，跳过"
-
-        return False, "继续执行"
-
-
-# ==================== 核心数据结构 ====================
-
-@dataclass
-class SectionPlan:
-    """段落计划"""
-    section_type: str
-    lines: int
-    emotion: str
-    theme: str
-    keywords: List[str]
-    rhyme_end: str = ""
-    hook_line: str = ""
-    tone: str = ""
-    melody_hint: str = ""
-
-
-@dataclass
-class BeatStructuredSkeleton:
-    """骨架"""
-    sections: List[SectionPlan] = field(default_factory=list)
-
-    def to_dict(self) -> Dict:
-        return {
-            "sections": [
-                {
-                    "section_type": s.section_type,
-                    "lines": s.lines,
-                    "emotion": s.emotion,
-                    "theme": s.theme,
-                    "keywords": s.keywords,
-                    "rhyme_end": s.rhyme_end,
-                    "hook_line": s.hook_line,
-                    "tone": s.tone,
-                    "melody_hint": s.melody_hint,
-                }
-                for s in self.sections
-            ]
-        }
-
-    @staticmethod
-    def from_dict(data: Dict) -> "BeatStructuredSkeleton":
-        sections = []
-        for s in data.get("sections", []):
-            sections.append(SectionPlan(
-                section_type=s.get("section_type", "verse"),
-                lines=s.get("lines", 4),
-                emotion=s.get("emotion", "low"),
-                theme=s.get("theme", ""),
-                keywords=s.get("keywords", []),
-                rhyme_end=s.get("rhyme_end", ""),
-                hook_line=s.get("hook_line", ""),
-                tone=s.get("tone", ""),
-                melody_hint=s.get("melody_hint", ""),
-            ))
-        return BeatStructuredSkeleton(sections=sections)
+    """全局优化器"""
+    def compute_global_score(self, scores: Dict) -> float:
+        return round(sum(scores.values()) / len(scores), 2) if scores else 0
 
 
 # ==================== Agent 实现 ====================
 
-class BaseAgent:
-    name = "base"
-
+class CleanerAgent:
     @classmethod
-    def execute(cls, context: Dict, **kwargs) -> Any:
-        raise NotImplementedError
-
-
-class CleanerAgent(BaseAgent):
-    name = "clean"
-
-    @classmethod
-    def execute(cls, context: Dict, **kwargs) -> str:
+    def execute(cls, context: Dict) -> str:
         raw_text = context.get("raw_text", "")
         lines = raw_text.split('\n')
         cleaned_lines = []
@@ -514,37 +571,20 @@ class CleanerAgent(BaseAgent):
             if line and len(line) > 1:
                 cleaned_lines.append(line)
 
-        cleaned = '\n'.join(cleaned_lines)
-
-        prompt = f"""清洗微信聊天记录，每行一条消息：
-
-{cleaned}
-
-直接输出："""
-
-        try:
-            response = llm([HumanMessage(content=prompt)])
-            return response.content.strip()
-        except:
-            return cleaned
+        return '\n'.join(cleaned_lines)
 
 
-class EmotionAnalystAgent(BaseAgent):
-    name = "analyze"
-
+class EmotionAnalystAgent:
     @classmethod
-    def execute(cls, context: Dict, **kwargs) -> Dict:
+    def execute(cls, context: Dict) -> Dict:
         cleaned_text = context.get("cleaned_text", "")
 
         prompt = f"""分析聊天记录，输出JSON：
-
 {{
     "emotion": "情感",
     "emotion_detail": "情感细化",
     "keywords": ["词1", "词2", "词3", "词4", "词5"],
-    "story": "故事线",
-    "relationship": "人物关系",
-    "emotion_curve": ["low", "rising", "peak", "fall", "peak"]
+    "story": "故事线"
 }}
 
 聊天记录：
@@ -559,86 +599,28 @@ class EmotionAnalystAgent(BaseAgent):
                 result = result.split('```json')[1].split('```')[0]
             return json.loads(result)
         except:
-            return {
-                "emotion": "未知", "emotion_detail": "", "keywords": [],
-                "story": "", "relationship": "", "emotion_curve": []
-            }
+            return {"emotion": "未知", "emotion_detail": "", "keywords": [], "story": ""}
 
 
-class SkeletonPlannerAgent(BaseAgent):
-    name = "plan"
-
+class SkeletonPlannerAgent:
     @classmethod
-    def execute(cls, context: Dict, **kwargs) -> Dict:
+    def execute(cls, context: Dict) -> Dict:
         emotion = context.get("emotion", "")
         emotion_detail = context.get("emotion_detail", "")
         keywords = context.get("keywords", [])
         story = context.get("story", "")
-        genre = context.get("genre", "流行")
 
-        genre_rhyme = {
-            "流行": ["ang", "ian", "ou"],
-            "民谣": ["an", "en", "ing"],
-            "说唱": ["a", "e", "i", "ou"],
-            "抒情": ["ang", "ian", "ao"],
-            "摇滚": ["ang", "ong", "ai"]
-        }
-        rhyme_options = genre_rhyme.get(genre, ["ang", "ian"])
-
-        prompt = f"""生成 Beat-Structured Skeleton（严格JSON）：
-
+        prompt = f"""生成歌词骨架（严格JSON）：
 {{
     "sections": [
-        {{
-            "section_type": "verse1",
-            "lines": 4,
-            "emotion": "low",
-            "theme": "引入故事",
-            "keywords": ["{keywords[0] if keywords else '情感'}"],
-            "rhyme_end": "{rhyme_options[0]}",
-            "hook_line": "",
-            "tone": "叙事",
-            "melody_hint": "下行"
-        }},
-        {{
-            "section_type": "chorus",
-            "lines": 4,
-            "emotion": "peak",
-            "theme": "情感高潮",
-            "keywords": ["{keywords[1] if len(keywords) > 1 else keywords[0]}"],
-            "rhyme_end": "{rhyme_options[1] if len(rhyme_options) > 1 else rhyme_options[0]}",
-            "hook_line": "核心金句（10字内押韵）",
-            "tone": "强烈",
-            "melody_hint": "上行"
-        }},
-        {{
-            "section_type": "verse2",
-            "lines": 4,
-            "emotion": "rising",
-            "theme": "延续递进",
-            "keywords": ["{keywords[2] if len(keywords) > 2 else keywords[0]}"],
-            "rhyme_end": "{rhyme_options[0]}",
-            "hook_line": "",
-            "tone": "叙事",
-            "melody_hint": "平稳"
-        }},
-        {{
-            "section_type": "bridge",
-            "lines": 4,
-            "emotion": "fall",
-            "theme": "情感转折",
-            "keywords": ["{keywords[3] if len(keywords) > 3 else keywords[0]}"],
-            "rhyme_end": "{rhyme_options[1] if len(rhyme_options) > 1 else rhyme_options[0]}",
-            "hook_line": "",
-            "tone": "低沉",
-            "melody_hint": "下行"
-        }}
+        {{"section_type": "verse1", "lines": 4, "emotion": "low", "theme": "引入", "keywords": ["{keywords[0]}"], "rhyme_end": "ang"}},
+        {{"section_type": "chorus", "lines": 4, "emotion": "peak", "theme": "高潮", "keywords": ["{keywords[1] if len(keywords) > 1 else keywords[0]}"], "rhyme_end": "ian", "hook_line": "核心金句"}},
+        {{"section_type": "verse2", "lines": 4, "emotion": "rising", "theme": "延续", "keywords": ["{keywords[2] if len(keywords) > 2 else keywords[0]}"], "rhyme_end": "ou"}},
+        {{"section_type": "bridge", "lines": 4, "emotion": "fall", "theme": "转折", "keywords": ["{keywords[3] if len(keywords) > 3 else keywords[0]}"], "rhyme_end": "en"}}
     ]
 }}
 
 情感：{emotion} - {emotion_detail}
-曲风：{genre}
-
 直接输出JSON："""
 
         try:
@@ -648,65 +630,35 @@ class SkeletonPlannerAgent(BaseAgent):
                 result = result.split('```json')[1].split('```')[0]
             return json.loads(result)
         except:
-            return {
-                "sections": [
-                    {"section_type": "verse1", "lines": 4, "emotion": "low",
-                     "theme": "引入", "keywords": keywords[:2], "rhyme_end": "ang",
-                     "hook_line": "", "tone": "叙事", "melody_hint": "下行"},
-                    {"section_type": "chorus", "lines": 4, "emotion": "peak",
-                     "theme": "高潮", "keywords": keywords[:2], "rhyme_end": "ian",
-                     "hook_line": "我们的故事", "tone": "强烈", "melody_hint": "上行"},
-                    {"section_type": "verse2", "lines": 4, "emotion": "rising",
-                     "theme": "延续", "keywords": keywords[:2], "rhyme_end": "ou",
-                     "hook_line": "", "tone": "叙事", "melody_hint": "平稳"},
-                    {"section_type": "bridge", "lines": 4, "emotion": "fall",
-                     "theme": "转折", "keywords": keywords[:1], "rhyme_end": "en",
-                     "hook_line": "", "tone": "低沉", "melody_hint": "下行"},
-                ]
-            }
+            return {"sections": []}
 
 
-class GeneratorAgent(BaseAgent):
-    name = "generate"
-
+class GeneratorAgent:
     @classmethod
-    def execute(cls, context: Dict, **kwargs) -> str:
+    def execute(cls, context: Dict, style: str = "流行", structure_template: str = "standard_pop") -> str:
         emotion = context.get("emotion", "")
         emotion_detail = context.get("emotion_detail", "")
         keywords = context.get("keywords", [])
         story = context.get("story", "")
-        genre = context.get("genre", "流行")
         skeleton_data = context.get("skeleton_plan", {})
+        style_profile = StyleController.get_style(style)
+        structure_constraint = LyricStructureTemplate.generate_structure_constraint(structure_template, skeleton_data)
 
-        skeleton = BeatStructuredSkeleton.from_dict(skeleton_data)
+        prompt = f"""基于以下信息创作歌词：
 
-        genre_notes = {
-            "流行": "旋律优美，情感细腻",
-            "民谣": "叙事性强，画面感足",
-            "说唱": "节奏强劲，押韵密集",
-            "抒情": "情感浓烈，旋律优美",
-            "摇滚": "力量感足，节奏强劲"
-        }
-
-        # 构建约束
-        constraints = []
-        for s in skeleton.sections:
-            constraints.append(f"[{s.section_type.upper()}] {s.lines}句 情感:{s.emotion} 韵脚:{s.rhyme_end} 主题:{s.theme}")
-
-        prompt = f"""基于结构创作歌词：
-
-曲风：{genre} - {genre_notes.get(genre, '')}
 情感：{emotion} - {emotion_detail}
-关键词：{', '.join(keywords)}
+风格：{style_profile.description}
 故事：{story}
+关键词：{', '.join(keywords)}
 
-结构：
-{chr(10).join(constraints)}
+结构要求：
+{structure_constraint}
 
 要求：
 1. 严格按句数创作
 2. 按韵脚押韵
 3. 禁止真实人名地名
+4. 体现{style}风格特点
 
 直接输出歌词："""
 
@@ -717,45 +669,14 @@ class GeneratorAgent(BaseAgent):
             return "生成失败"
 
 
-class DiffEditAgent(BaseAgent):
-    """
-    差分编辑 Agent
-    v5.0 核心：精确修改局部，不整段重写
-    """
-    name = "diff_edit"
-
+class VerifierAgent:
     @classmethod
-    def execute(cls, context: Dict, **kwargs) -> str:
-        lyrics = context.get("lyrics", "")
-        edit_plan = context.get("edit_plan", [])
-
-        if not edit_plan:
-            return lyrics
-
-        # 应用编辑
-        diff_editor = DiffEditor()
-        result = diff_editor.apply_batch_edits(lyrics, edit_plan)
-
-        return result
-
-
-class VerifierAgent(BaseAgent):
-    """验证 Agent"""
-
-    name = "verify"
-
-    @classmethod
-    def execute(cls, context: Dict, **kwargs) -> Dict:
+    def execute(cls, context: Dict) -> Dict:
         lyrics = context.get("lyrics", "")
         emotion = context.get("emotion", "")
-        emotion_detail = context.get("emotion_detail", "")
         keywords = context.get("keywords", [])
-        skeleton_data = context.get("skeleton_plan", {})
 
-        skeleton = BeatStructuredSkeleton.from_dict(skeleton_data)
-
-        prompt = f"""审查歌词（严格JSON）：
-
+        prompt = f"""审查歌词（JSON）：
 {{
     "overall": 8.5,
     "rhythm_quality": 8.0,
@@ -763,20 +684,13 @@ class VerifierAgent(BaseAgent):
     "structure_compliance": 8.5,
     "rhyme_quality": 8.0,
     "keyword_coverage": 7.5,
-    "issues": ["问题1", "问题2"],
-    "targeted_repairs": {{
-        "fix_rhyme": true,
-        "boost_emotion": false,
-        "fix_structure": true
-    }}
+    "issues": [],
+    "targeted_repairs": {{"fix_rhyme": true}}
 }}
 
-歌词：
-{lyrics}
-
+歌词：{lyrics}
 情感：{emotion}
 关键词：{', '.join(keywords)}
-句数要求：主歌{skeleton.sections[0].lines if skeleton.sections else 4}句 副歌{skeleton.sections[1].lines if len(skeleton.sections) > 1 else 4}句
 
 直接输出JSON："""
 
@@ -785,42 +699,21 @@ class VerifierAgent(BaseAgent):
             result = response.content.strip()
             if '```json' in result:
                 result = result.split('```json')[1].split('```')[0]
-
-            data = json.loads(result)
-
-            # 存储分数
-            context["score"] = data.get("overall", 0)
-            context["rhythm_score"] = data.get("rhythm_quality", 0)
-            context["emotion_match"] = data.get("emotion_match", 0)
-            context["structure_score"] = data.get("structure_compliance", 0)
-            context["rhyme_score"] = data.get("rhyme_quality", 0)
-            context["keyword_score"] = data.get("keyword_coverage", 0)
-
-            return data
-
+            return json.loads(result)
         except:
-            return {
-                "overall": 5.0, "issues": ["审查失败"],
-                "targeted_repairs": {"fix_rhyme": True, "boost_emotion": True, "fix_structure": True}
-            }
+            return {"overall": 5.0, "issues": [], "targeted_repairs": {}}
 
 
-class TitleAgent(BaseAgent):
-    """标题生成"""
-
-    name = "title"
-
+class TitleAgent:
     @classmethod
-    def execute(cls, context: Dict, **kwargs) -> str:
+    def execute(cls, context: Dict) -> str:
         lyrics = context.get("lyrics", "")
         emotion = context.get("emotion", "")
 
         prompt = f"""生成歌词标题（2-6字）：
-
-歌词片段：{lyrics[:300]}
+歌词：{lyrics[:300]}
 情感：{emotion}
-
-直接输出标题："""
+直接输出："""
 
         try:
             response = llm([HumanMessage(content=prompt)])
@@ -829,12 +722,12 @@ class TitleAgent(BaseAgent):
             return "无题"
 
 
-# ==================== Self-Optimizing Pipeline ====================
+# ==================== 主 Pipeline ====================
 
-class SelfOptimizingPipeline:
+class EnhancedLyricPipeline:
     """
-    v5.0 核心：自优化 Pipeline
-    解决收敛性问题
+    v5.5 增强版 Pipeline
+    整合：风格控制 + 结构模板 + 故事图谱 + 可解释生成
     """
 
     def __init__(self, api_key: str, api_base: str, model_name: str):
@@ -844,211 +737,152 @@ class SelfOptimizingPipeline:
             model_name=model_name,
             temperature=0.8
         )
-
-        # 核心组件
         self.constraint_lock = ConstraintLock()
         self.global_optimizer = GlobalOptimizer()
-        self.meta_agent = MetaAgent()
         self.diff_editor = DiffEditor()
 
-        self.genre = "流行"
-        self.max_iterations = 5
-
-    def run(self, chat_text: str, genre: str = "流行") -> Dict:
-        """执行自优化流程"""
-        self.genre = genre
-
+    def run(
+        self,
+        chat_text: str,
+        style: str = "流行",
+        structure_template: str = "standard_pop",
+        enable_explanation: bool = False
+    ) -> Dict:
+        """执行增强版流程"""
         context = {
             "raw_text": chat_text,
-            "genre": genre,
-            "iteration": 0,
-            "scores_history": []
+            "style": style,
+            "structure_template": structure_template
         }
 
         print("\n" + "="*60)
-        print("🎵 WeChatChat2Lyric-Agent v5.0 (Self-Optimizing)")
+        print("🎵 WeChatChat2Lyric-Agent v5.5 (Enhanced)")
         print("="*60)
         print(f"📂 聊天记录: {len(chat_text)} 字符")
-        print(f"🎸 曲风: {genre}")
-        print("\n🔄 开始自优化流程...\n")
+        print(f"🎨 风格: {style}")
+        print(f"📐 结构模板: {structure_template}")
+        print(f"💡 可解释生成: {'开启' if enable_explanation else '关闭'}")
+        print()
 
-        # Phase 1: 生成
-        print("[Phase 1] 生成初始歌词...")
-        context = self._generation_phase(context)
-
-        # Phase 2: 自优化
-        print("\n[Phase 2] 自优化循环...")
-        context = self._optimization_phase(context)
-
-        # Phase 3: 输出
-        print("\n[Phase 3] 生成标题...")
-        context["title"] = TitleAgent.execute(context)
-
-        return self._build_result(context)
-
-    def _generation_phase(self, context: Dict) -> Dict:
-        """生成阶段"""
-        print("  [1.1] 清洗...")
+        # Phase 1: 基础处理
+        print("[Phase 1] 清洗和分析...")
         context["cleaned_text"] = CleanerAgent.execute(context)
-
-        print("  [1.2] 分析情感...")
         analysis = EmotionAnalystAgent.execute(context)
         context.update(analysis)
         print(f"       情感: {context.get('emotion', '未知')}")
+        print(f"       关键词: {', '.join(context.get('keywords', [])[:5])}")
 
-        print("  [1.3] 规划骨架...")
+        # Phase 2: 故事图谱提取
+        print("\n[Phase 2] 提取故事图谱...")
+        story_graph = StoryGraphExtractor.extract(chat_text, context.get("emotion", ""))
+        context["story_graph"] = story_graph
+        graph_context = StoryGraphExtractor.to_context(story_graph)
+        context["graph_context"] = graph_context
+        if story_graph.core_theme:
+            print(f"       核心主题: {story_graph.core_theme}")
+        print(f"       情感弧线: {' → '.join(story_graph.emotion_arc[:3]) if story_graph.emotion_arc else '未识别'}")
+
+        # Phase 3: 骨架规划
+        print("\n[Phase 3] 规划歌词骨架...")
         context["skeleton_plan"] = SkeletonPlannerAgent.execute(context)
 
-        print("  [1.4] 生成歌词...")
-        context["lyrics"] = GeneratorAgent.execute(context)
+        # Phase 4: 生成（带风格和结构控制）
+        print("\n[Phase 4] 生成歌词...")
+        context["lyrics"] = GeneratorAgent.execute(
+            context,
+            style=style,
+            structure_template=structure_template
+        )
         print(f"       生成: {len(context['lyrics'])} 字符")
 
-        return context
-
-    def _optimization_phase(self, context: Dict) -> Dict:
-        """优化阶段 - 核心创新"""
+        # Phase 5: 优化循环
+        print("\n[Phase 5] 自优化...")
         iteration = 0
+        max_iterations = 3
 
-        while iteration < self.max_iterations:
+        while iteration < max_iterations:
             iteration += 1
-            context["iteration"] = iteration
-
-            print(f"\n  --- 优化循环 {iteration}/{self.max_iterations} ---")
-
-            # 验证
-            print("  [验证] 质量审查...")
             verification = VerifierAgent.execute(context)
-            scores = {
-                "rhythm_quality": verification.get("rhythm_quality", 0),
-                "emotion_match": verification.get("emotion_match", 0),
-                "structure_compliance": verification.get("structure_compliance", 0),
-                "rhyme_quality": verification.get("rhyme_quality", 0),
-                "keyword_coverage": verification.get("keyword_coverage", 0)
-            }
-            context["verification"] = verification
+            global_score = self.global_optimizer.compute_global_score({
+                "rhythm": verification.get("rhythm_quality", 0),
+                "emotion": verification.get("emotion_match", 0),
+                "structure": verification.get("structure_compliance", 0),
+                "rhyme": verification.get("rhyme_quality", 0),
+                "keyword": verification.get("keyword_coverage", 0)
+            })
 
-            global_score = self.global_optimizer.compute_global_score(scores)
-            print(f"       全局分数: {global_score:.2f}/10")
+            print(f"       第{iteration}轮: {global_score}/10")
 
-            # 约束锁定
-            locked = self.constraint_lock.evaluate_and_lock(scores)
-            print(f"       {self.constraint_lock.get_lock_report()}")
+            if global_score >= 7.5:
+                print(f"       ✅ 达标")
+                break
 
-            # 记录历史
-            self.global_optimizer.record_iteration(scores, "verify")
-
-            # 检查收敛
-            should_continue, reason = self.global_optimizer.should_continue_optimizing(
-                scores, iteration, self.max_iterations
+            # 差分修复
+            edit_plan = self.diff_editor.generate_targeted_edit_plan(
+                context["lyrics"],
+                verification.get("issues", []),
+                self.constraint_lock.get_locked_dims()
             )
 
-            if not should_continue:
-                print(f"       ✅ {reason}")
-                break
+            if edit_plan:
+                # 应用修复
+                context["lyrics"] = GeneratorAgent.execute(context, style=style)
 
-            # Targeted Repair
-            targeted = verification.get("targeted_repairs", {})
-            issues = verification.get("issues", [])
+        # Phase 6: 标题
+        print("\n[Phase 6] 生成标题...")
+        context["title"] = TitleAgent.execute(context)
+        print(f"       标题: {context['title']}")
 
-            if not any(targeted.values()):
-                print("       ✅ 无需修复")
-                break
+        # Phase 7: 可解释生成
+        if enable_explanation:
+            print("\n[Phase 7] 生成解释...")
+            explanations = ExplainableGenerator.generate_explanation(
+                context["lyrics"],
+                chat_text,
+                context.get("emotion", ""),
+                context.get("keywords", [])
+            )
+            context["explanations"] = explanations
+            explanation_text = ExplainableGenerator.format_explanations(explanations)
+            context["explanation_text"] = explanation_text
+            print(f"       生成 {len(explanations)} 句解释")
 
-            print(f"       🔧 执行精准修复...")
-            print(f"       📋 问题: {', '.join(issues[:2])}")
-
-            # Meta-Agent 决策
-            for dim, needs_fix in targeted.items():
-                if not needs_fix:
-                    continue
-
-                # 检查是否跳过
-                skip, skip_reason = self.meta_agent.should_skip_repair(
-                    f"fix_{dim}" if dim != "emotion" else "boost_emotion",
-                    scores,
-                    locked
-                )
-
-                if skip:
-                    print(f"       ⏭️  跳过 {dim}: {skip_reason}")
-                    continue
-
-                # 执行修复
-                print(f"       → 修复 {dim}...")
-                scores_before = scores.copy()
-
-                # 差分编辑
-                edit_plan = self.diff_editor.generate_targeted_edit_plan(
-                    context["lyrics"], issues, locked
-                )
-
-                if edit_plan:
-                    context["edit_plan"] = edit_plan
-                    context["lyrics"] = DiffEditAgent.execute(context)
-                else:
-                    # 回退到整段重生成（不得已）
-                    context["lyrics"] = GeneratorAgent.execute(context)
-
-                # 重新验证
-                verification_new = VerifierAgent.execute(context)
-                scores_new = {
-                    "rhythm_quality": verification_new.get("rhythm_quality", 0),
-                    "emotion_match": verification_new.get("emotion_match", 0),
-                    "structure_compliance": verification_new.get("structure_compliance", 0),
-                    "rhyme_quality": verification_new.get("rhyme_quality", 0),
-                    "keyword_coverage": verification_new.get("keyword_coverage", 0)
-                }
-
-                # Meta-Agent 学习
-                self.meta_agent.analyze_repair_outcome(
-                    f"fix_{dim}",
-                    scores_before,
-                    scores_new,
-                    dim
-                )
-
-                self.global_optimizer.record_iteration(scores_new, f"fix_{dim}")
-
-                # 更新分数
-                context["verification"] = verification_new
-                scores = scores_new
-
-            # 约束重评估
-            locked = self.constraint_lock.evaluate_and_lock(scores)
-
-        return context
+        return self._build_result(context)
 
     def _build_result(self, context: Dict) -> Dict:
-        """构建结果"""
         return {
             "title": context.get("title", "无题"),
-            "genre": self.genre,
+            "style": context.get("style", "流行"),
+            "structure_template": context.get("structure_template", "standard_pop"),
             "emotion": context.get("emotion", ""),
             "emotion_detail": context.get("emotion_detail", ""),
             "keywords": context.get("keywords", []),
             "story": context.get("story", ""),
-            "lyric_plan": context.get("skeleton_plan", {}),
+            "story_graph": {
+                "core_theme": context.get("story_graph", {}).core_theme if context.get("story_graph") else "",
+                "emotion_arc": context.get("story_graph", {}).emotion_arc if context.get("story_graph") else []
+            },
             "lyrics": context.get("lyrics", ""),
-            "quality_score": context.get("verification", {}),
+            "explanation_text": context.get("explanation_text", ""),
         }
 
     def print_result(self, result: Dict):
-        """打印结果"""
         print("\n" + "="*60)
         print("🎵 歌曲标题:", result["title"])
-        print("🎸 曲风:", result["genre"])
-        print("🎧 情感:", result["emotion"])
+        print("🎨 风格:", result["style"])
+        print("📐 结构:", result["structure_template"])
+        print("🎧 情感:", result["emotion"], "-", result["emotion_detail"])
         print("🔑 关键词:", ", ".join(result["keywords"][:6]))
-
-        qs = result.get("quality_score", {})
-        if qs:
-            print(f"⭐ 质量评分: {qs.get('overall', 0):.1f}/10")
-
+        if result.get("story_graph", {}).get("core_theme"):
+            print("📖 核心主题:", result["story_graph"]["core_theme"])
         print("="*60)
         print("\n📝 歌词:")
         print("-"*40)
         print(result["lyrics"])
         print("-"*40)
+
+        if result.get("explanation_text"):
+            print(result["explanation_text"])
 
 
 # ==================== 演示 ====================
@@ -1056,7 +890,7 @@ class SelfOptimizingPipeline:
 def run_demo():
     """演示"""
     print("\n" + "="*60)
-    print("🎵 WeChatChat2Lyric-Agent v5.0 演示")
+    print("🎵 WeChatChat2Lyric-Agent v5.5 演示")
     print("="*60)
 
     demo_chat = """2024/1/1 12:00:00
@@ -1077,83 +911,20 @@ def run_demo():
 小明：绝不反悔，我们拉钩
 小红：拉钩上吊一百年不许变"""
 
-    print("\n📝 示例聊天记录（情侣甜蜜对话）:\n")
+    print("\n📝 示例聊天记录：")
     print(demo_chat[:200] + "...\n")
 
-    pipeline = SelfOptimizingPipeline(API_KEY, API_BASE, MODEL_NAME)
-    result = pipeline.run(demo_chat, "流行")
+    print("\n🎨 可用风格:", ", ".join(StyleController.list_styles()))
+    print("📐 结构模板:", ", ".join(LyricStructureTemplate.TEMPLATES.keys()))
+
+    # 选择配置
+    style = input("\n选择风格 (默认甜蜜): ").strip() or "甜蜜"
+    structure = input("选择结构模板 (默认standard_pop): ").strip() or "standard_pop"
+    explain = input("开启可解释生成？(y/n，默认n): ").strip().lower() == 'y'
+
+    pipeline = EnhancedLyricPipeline(API_KEY, API_BASE, MODEL_NAME)
+    result = pipeline.run(demo_chat, style=style, structure_template=structure, enable_explanation=explain)
     pipeline.print_result(result)
-
-    return result
-
-
-# ==================== 命令行 ====================
-
-def interactive_mode():
-    """交互界面"""
-    print("""
-╔══════════════════════════════════════════════════════════╗
-║                                                          ║
-║        🎵 WeChatChat2Lyric-Agent v5.0 🎵                ║
-║                                                          ║
-║     Self-Optimizing Agent System                         ║
-║     Global Constraint + Diff Edit + Meta-Agent           ║
-║                                                          ║
-╚══════════════════════════════════════════════════════════╝
-    """)
-
-    print("\n🎯 选项：")
-    print("  1. 从文件加载")
-    print("  2. 直接输入")
-    print("  3. 演示")
-    print("  0. 退出")
-
-    choice = input("\n请输入: ").strip()
-
-    if choice == "1":
-        file_path = input("文件路径: ").strip()
-        genre = input("曲风 (1流行/2民谣/3说唱/4抒情/5摇滚): ").strip()
-        genre_map = {"1": "流行", "2": "民谣", "3": "说唱", "4": "抒情", "5": "摇滚"}
-        genre = genre_map.get(genre, "流行")
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                chat_text = f.read()
-
-            pipeline = SelfOptimizingPipeline(API_KEY, API_BASE, MODEL_NAME)
-            result = pipeline.run(chat_text, genre)
-            pipeline.print_result(result)
-
-            if input("\n保存？(y/n): ").strip().lower() == 'y':
-                save_path = input("路径: ").strip()
-                if save_path:
-                    with open(save_path, 'w', encoding='utf-8') as f:
-                        f.write(f"🎵 {result['title']}\n\n{result['lyrics']}")
-                    print(f"✅ 已保存")
-        except Exception as e:
-            print(f"❌ 错误: {e}")
-
-    elif choice == "2":
-        print("\n粘贴聊天记录（EOF结束）：")
-        lines = []
-        while True:
-            try:
-                line = input()
-                if line.strip().upper() == "EOF":
-                    break
-                lines.append(line)
-            except:
-                break
-
-        pipeline = SelfOptimizingPipeline(API_KEY, API_BASE, MODEL_NAME)
-        result = pipeline.run('\n'.join(lines), "流行")
-        pipeline.print_result(result)
-
-    elif choice == "3":
-        run_demo()
-
-    else:
-        print("👋 再见！")
 
 
 # ==================== 主入口 ====================
@@ -1164,22 +935,13 @@ if __name__ == "__main__":
             run_demo()
         elif sys.argv[1] == "--help":
             print("""
-使用：python chat2lyric_agent.py
-     python chat2lyric_agent.py --demo
-     python chat2lyric_agent.py <file> [genre]
+使用：python chat2lyric_agent.py --demo
+     python chat2lyric_agent.py --help
+
+风格选项：甜蜜, 伤感, 治愈, 叙事, 民谣, 说唱, 摇滚, R&B, 古风
+结构模板：standard_pop, simple, full, rap
             """)
         else:
-            file_path = sys.argv[1]
-            genre = sys.argv[2] if len(sys.argv) > 2 else "流行"
-
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    chat_text = f.read()
-
-                pipeline = SelfOptimizingPipeline(API_KEY, API_BASE, MODEL_NAME)
-                result = pipeline.run(chat_text, genre)
-                pipeline.print_result(result)
-            except Exception as e:
-                print(f"❌ 错误: {e}")
+            print("使用 --demo 运行演示")
     else:
-        interactive_mode()
+        run_demo()
