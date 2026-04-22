@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile chat2lyric_agent.py)",
+      "Bash(ls:*)"
+    ]
+  }
+}
