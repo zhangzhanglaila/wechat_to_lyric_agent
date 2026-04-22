@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(python -m py_compile chat2lyric_agent.py)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(pip show:*)",
+      "Bash(python chat2lyric_agent.py --demo)",
+      "Bash(chcp 65001)",
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(PYTHONIOENCODING=utf-8 python chat2lyric_agent.py --demo)",
+      "Bash(PYTHONIOENCODING=utf-8 python chat2lyric_agent.py --help)",
+      "Bash(python -c ':*)"
     ]
   }
 }
