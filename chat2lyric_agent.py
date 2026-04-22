@@ -26,7 +26,7 @@ from langchain.schema import HumanMessage
 # ==================== 配置 ====================
 load_dotenv()
 
-API_KEY = os.getenv("OPENAI_API_KEY", "sk-46cbfd6c10cd4fb3a9340a1dda2a1c07")
+API_KEY = os.getenv("OPENAI_API_KEY")
 API_BASE = os.getenv("OPENAI_API_BASE", "https://api.deepseek.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-chat")
 
