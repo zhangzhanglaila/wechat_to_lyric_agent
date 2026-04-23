@@ -1,6 +1,9 @@
 # 环境变量（包含敏感信息）
 .env
 
+# Memory 文件（设计文档，不提交）
+.memory/
+
 # Python
 __pycache__/
 *.py[cod]
