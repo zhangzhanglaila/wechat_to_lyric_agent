@@ -1,12 +1,27 @@
 """
-v7.5 Agent OS - Execution Gate + System Health
+v7.8 Agent OS - Emotion-Aware Execution Gate
 ============================================
-核心升级：统一执行门控层
+核心升级：Emotion-Aware Execution Gate
 
-v7.4 → v7.5：
-1. Execution Gate - 统一的任务入口和准入控制
-2. System Health Score - 系统健康度量化
-3. Global Feedback Loop - 执行结果闭环反馈
+v7.7 → v7.8：
+1. EmotionBias - Gate 生成的情绪偏置，直接影响艺术生成
+2. StateSnapshot 增加 emotion_bias 字段
+3. ExecutionGate.generate_emotion_bias() - 纯函数生成情绪决策
+4. ArtPipeline.run_with_bias() - 受 bias 驱动的自适应生成
+
+架构变化：
+        StateSnapshot
+               ↓
+    ExecutionGate (enhanced)
+    ├── system health
+    ├── task admission
+    └── emotion bias (NEW)
+               ↓
+    ArtPipeline (adaptive)
+    ├── compression (bias-driven)
+    ├── emotion shaping
+    ├── rhythm selection
+    └── rendering (bias-constrained)
 
 从 "分散控制点" → "统一执行门控"
 
@@ -46,7 +61,7 @@ import hashlib
 import threading
 import queue
 import copy
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, FrozenSet
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from dotenv import load_dotenv
@@ -200,6 +215,180 @@ class SchedulingDecision:
     depth: int = 0
     admitted: bool = True
     health_score: float = 1.0  # v7.5
+
+
+@dataclass(frozen=True)
+class TaskSnapshot:
+    """不可变任务快照 - 用于确定性重放"""
+    id: str
+    agent_type: str
+    priority: int
+    dependencies: FrozenSet[str]
+    estimated_cost: float
+    depth: int
+    status: str
+    created_at: float
+
+
+@dataclass(frozen=True)
+class WorkerSnapshot:
+    """不可变Worker快照"""
+    worker_id: str
+    worker_type: str
+    load: float
+    capacity: float
+    tasks_completed: int
+    is_available: bool
+
+
+@dataclass(frozen=True)
+class QueueSnapshot:
+    """不可变队列快照"""
+    ready_count: int
+    delayed_count: int
+    running_count: int
+    completed_count: int
+    failed_count: int
+
+
+@dataclass(frozen=True)
+class CostModelSnapshot:
+    """不可变成本模型快照"""
+    agent_types: FrozenSet[str]
+    cost_error: float
+    total_observations: int
+
+
+@dataclass(frozen=True)
+class EmotionBias:
+    """
+    EmotionBias - v7.8 核心：系统决策产生的情绪偏置
+    ====================
+    由 ExecutionGate 在评估时生成，直接影响 ArtPipeline 的行为
+
+    区别于 EmotionVector：
+    - EmotionVector: 描述"当前情绪状态"
+    - EmotionBias: 指导"如何生成艺术"
+    """
+    # 情绪偏向描述
+    emotion_descriptor: str  # e.g. "nostalgia + unresolved_attachment"
+    intensity: float  # 0.0-1.0
+
+    # 节奏控制
+    rhythm_bias: str  # "slow_build" | "steady" | "pulse" | "fade"
+    hook_position: str  # "first" | "third" | "last" | "bridge"
+
+    # 压缩模式
+    compression_mode: str  # "fragmented" | "coherent" | "associative" | "chronological"
+
+    # 强度曲线
+    intensity_curve: str  # "low_peak_fade" | "build_peak" | "steady" | "wave"
+
+    # 系统健康度（影响创作信心）
+    system_health: float
+
+    @staticmethod
+    def default() -> 'EmotionBias':
+        return EmotionBias(
+            emotion_descriptor="neutral",
+            intensity=0.5,
+            rhythm_bias="steady",
+            hook_position="last",
+            compression_mode="coherent",
+            intensity_curve="build_peak",
+            system_health=0.5
+        )
+
+    def to_art_constraints(self) -> Dict[str, Any]:
+        """转换为艺术生成的约束条件"""
+        return {
+            "emotion": self.emotion_descriptor,
+            "intensity": self.intensity,
+            "rhythm": self.rhythm_bias,
+            "hook_position": self.hook_position,
+            "compression_mode": self.compression_mode,
+            "intensity_curve": self.intensity_curve,
+            "temperature": 0.7 if self.intensity > 0.6 else 0.85
+        }
+
+
+@dataclass(frozen=True)
+class StateSnapshot:
+    """不可变系统状态快照 - 用于确定性决策"""
+    timestamp: float
+    logical_time: int
+    workers: FrozenSet[WorkerSnapshot]
+    queue: QueueSnapshot
+    cost_model: CostModelSnapshot
+    load_threshold: float
+    queue_high_water: int
+    total_submissions: int
+    total_rejections: int
+    emotion_bias: Optional[EmotionBias] = None  # v7.8: 情绪偏置
+
+    def get_system_load(self) -> float:
+        if not self.workers:
+            return 0.0
+        return sum(w.load for w in self.workers) / len(self.workers)
+
+    def get_queue_pressure(self) -> float:
+        return self.queue.ready_count / max(self.queue_high_water, 1)
+
+    def compute_health(self) -> float:
+        load = self.get_system_load()
+        queue_pressure = self.get_queue_pressure()
+        rejection_rate = self.total_rejections / max(self.total_submissions, 1)
+        return (1 - load) * 0.4 + (1 - queue_pressure) * 0.3 + (1 - rejection_rate) * 0.3
+
+
+class StateSnapshotBuilder:
+    """快照构建器 - 封装构建逻辑"""
+
+    def build(self, scheduler, worker_pool, cost_tracker) -> StateSnapshot:
+        from time import time
+
+        workers = frozenset([
+            WorkerSnapshot(
+                worker_id=w.id,
+                worker_type=w.worker_type.value,
+                load=w.get_load(),
+                capacity=w.capacity,
+                tasks_completed=w.tasks_completed,
+                is_available=w.is_available()
+            )
+            for w in worker_pool._workers.values()
+        ])
+
+        queue = QueueSnapshot(
+            ready_count=len(scheduler.ready_queue) if hasattr(scheduler, 'ready_queue') else 0,
+            delayed_count=len(scheduler.delayed_queue) if hasattr(scheduler, 'delayed_queue') else 0,
+            running_count=worker_pool.active_count if hasattr(worker_pool, 'active_count') else 0,
+            completed_count=worker_pool.tasks_completed if hasattr(worker_pool, 'tasks_completed') else 0,
+            failed_count=worker_pool.tasks_failed if hasattr(worker_pool, 'tasks_failed') else 0
+        )
+
+        agent_types = frozenset(cost_tracker.estimated_costs.keys()) if hasattr(cost_tracker, 'estimated_costs') else frozenset()
+        cost_error = cost_tracker.cost_error if hasattr(cost_tracker, 'cost_error') else 0.0
+        observations = cost_tracker.total_observations if hasattr(cost_tracker, 'total_observations') else 0
+
+        cost = CostModelSnapshot(
+            agent_types=agent_types,
+            cost_error=cost_error,
+            total_observations=observations
+        )
+
+        return StateSnapshot(
+            timestamp=time(),
+            logical_time=scheduler.clock.value if hasattr(scheduler, 'clock') else 0,
+            workers=workers,
+            queue=queue,
+            cost_model=cost,
+            load_threshold=worker_pool.load_threshold if hasattr(worker_pool, 'load_threshold') else 0.8,
+            queue_high_water=scheduler.queue_high_water if hasattr(scheduler, 'queue_high_water') else 10,
+            total_submissions=scheduler.total_submissions if hasattr(scheduler, 'total_submissions') else 0,
+            total_rejections=scheduler.total_rejections if hasattr(scheduler, 'total_rejections') else 0,
+            emotion_bias=None  # v7.8: 由 Gate 注入
+        )
 
 
 @dataclass
@@ -647,10 +836,10 @@ class ExecutionGate:
 
     def __init__(
         self,
-        scheduler: 'Scheduler',
-        worker_pool: 'WorkerPool',
-        cost_tracker: AdaptiveCostTracker,
-        state_store: StateStore
+        scheduler: 'Scheduler' = None,
+        worker_pool: 'WorkerPool' = None,
+        cost_tracker: AdaptiveCostTracker = None,
+        state_store: StateStore = None
     ):
         self.scheduler = scheduler
         self.worker_pool = worker_pool
@@ -684,6 +873,11 @@ class ExecutionGate:
         )
         """
         with self._lock:
+            # Standalone mode (pure function testing)
+            if self.worker_pool is None or self.scheduler is None or self.cost_tracker is None:
+                rejection_rate = self._total_rejections / max(self._total_submissions, 1)
+                return 1.0 - rejection_rate
+
             # 1. Worker 负载（越低越好）
             system_load = self.worker_pool.get_system_load()
             load_score = 1.0 - system_load  # 0.0 满载 → 1.0 空闲
@@ -712,12 +906,20 @@ class ExecutionGate:
 
             return max(0.0, min(1.0, health))
 
-    def evaluate(self, task: Task) -> GateResult:
+    def evaluate(self, task_or_state, task_snapshot=None) -> GateResult:
         """
         评估任务是否可接受（统一门控）
         ====================
-        v7.5 核心：单一入口，统一决策
+        v7.5/v7.6 双模式支持：
+        - evaluate(task: Task) → 基于实时系统状态
+        - evaluate(state: StateSnapshot, task_snapshot: TaskSnapshot) → 基于快照的纯函数
         """
+        # 纯函数模式：基于快照的确定性评估
+        if isinstance(task_or_state, StateSnapshot) and task_snapshot is not None:
+            return self.evaluate_state(task_or_state, task_snapshot)
+
+        # 实时模式：基于实际系统状态
+        task = task_or_state
         with self._lock:
             self._total_submissions += 1
             health = self.get_system_health()
@@ -756,6 +958,182 @@ class ExecutionGate:
                 reason=reason,
                 health_score=health
             )
+
+    def evaluate_state(self, state: StateSnapshot, task_snapshot: TaskSnapshot) -> 'GateResult':
+        """
+        纯函数评估 - 基于快照的确定性决策
+        v7.6 核心特性：支持确定性重放
+        """
+        system_load = state.get_system_load()
+        queue_pressure = state.get_queue_pressure()
+
+        # 决策逻辑
+        if system_load >= 0.95:
+            decision = GateDecision.REJECT
+            reason = f"system overload: load={system_load:.2f}"
+        elif queue_pressure >= 1.0:
+            if task_snapshot.priority >= 4:  # CRITICAL
+                decision = GateDecision.ACCEPT
+                reason = "critical task bypasses queue limit"
+            else:
+                decision = GateDecision.DELAY
+                reason = f"queue full: pressure={queue_pressure:.2f}"
+        else:
+            decision = GateDecision.ACCEPT
+            reason = f"healthy: load={system_load:.2f}, pressure={queue_pressure:.2f}"
+
+        return GateResult(
+            decision=decision,
+            task_id=task_snapshot.id,
+            reason=reason,
+            health_score=state.compute_health()
+        )
+
+    def generate_emotion_bias(
+        self,
+        state: StateSnapshot,
+        emotion_vector: 'EmotionVector',
+        task_snapshot: TaskSnapshot = None
+    ) -> EmotionBias:
+        """
+        v7.8 核心：生成情绪偏置
+        ====================
+        ExecutionGate 不仅决定"执行与否"，还决定"如何生成艺术"
+
+        输入：
+        - state: 系统快照（包含健康度等信息）
+        - emotion_vector: 从 ChatCompression 提取的情绪向量
+        - task_snapshot: 任务快照（可选，包含任务元数据）
+
+        输出：
+        - EmotionBias: 直接指导 ArtPipeline 的行为
+        """
+        primary_emotion, intensity = emotion_vector.get_primary()
+        health = state.compute_health()
+
+        # 1. 情绪描述符：从 emotion_vector 映射
+        emotion_descriptor = self._map_emotion_to_descriptor(primary_emotion, emotion_vector)
+
+        # 2. 节奏偏置：基于系统负载
+        rhythm_bias = self._derive_rhythm_bias(health, intensity)
+
+        # 3. Hook 位置：基于情绪强度
+        hook_position = self._derive_hook_position(intensity)
+
+        # 4. 压缩模式：基于系统健康度
+        compression_mode = self._derive_compression_mode(health, primary_emotion)
+
+        # 5. 强度曲线：基于情绪组合
+        intensity_curve = self._derive_intensity_curve(emotion_vector)
+
+        return EmotionBias(
+            emotion_descriptor=emotion_descriptor,
+            intensity=intensity,
+            rhythm_bias=rhythm_bias,
+            hook_position=hook_position,
+            compression_mode=compression_mode,
+            intensity_curve=intensity_curve,
+            system_health=health
+        )
+
+    def _map_emotion_to_descriptor(self, primary: str, vector: 'EmotionVector') -> str:
+        """将情绪向量映射为描述符"""
+        descriptors = {
+            "sadness": "unresolved_longing",
+            "nostalgia": "warm_bittersweet",
+            "joy": "euphoric_clarity",
+            "anger": "intense_clarity",
+            "warmth": "gentle_acceptance",
+            "loneliness": "isolated_contemplation",
+            "hope": "anticipatory_tension",
+            "regret": "missed_opportunity"
+        }
+
+        # 如果有混合情绪，生成复合描述符
+        secondaries = []
+        for emotion, value in [
+            ("sadness", vector.sadness),
+            ("nostalgia", vector.nostalgia),
+            ("loneliness", vector.loneliness),
+            ("regret", vector.regret)
+        ]:
+            if value > 0.3 and emotion != primary:
+                secondaries.append(emotion)
+
+        base = descriptors.get(primary, "neutral_melancholy")
+        if secondaries:
+            return f"{base}_{'+'.join(secondaries[:2])}"
+        return base
+
+    def _derive_rhythm_bias(self, health: float, intensity: float) -> str:
+        """从系统健康度派生节奏偏置"""
+        if health > 0.7:
+            return "steady"
+        elif health > 0.4:
+            return "build" if intensity > 0.5 else "pulse"
+        else:
+            return "fade"
+
+    def _derive_hook_position(self, intensity: float) -> str:
+        """从情绪强度派生 Hook 位置"""
+        if intensity > 0.7:
+            return "first"
+        elif intensity > 0.4:
+            return "third"
+        else:
+            return "last"
+
+    def _derive_compression_mode(self, health: float, primary_emotion: str) -> str:
+        """从健康度和情绪派生压缩模式"""
+        if health < 0.3:
+            return "fragmented"
+        elif primary_emotion in ("nostalgia", "memory"):
+            return "associative"
+        elif primary_emotion in ("sadness", "regret"):
+            return "chronological"
+        else:
+            return "coherent"
+
+    def _derive_intensity_curve(self, vector: 'EmotionVector') -> str:
+        """从情绪向量派生强度曲线"""
+        # 检查是否有"渐强"特征
+        if vector.hope > 0.4 and vector.sadness > 0.3:
+            return "low_peak_fade"
+        # 检查是否有"平静"特征
+        elif vector.warmth > 0.5:
+            return "steady"
+        # 检查是否有"波动"特征
+        elif (vector.sadness > 0.3 and vector.nostalgia > 0.3):
+            return "wave"
+        # 默认
+        return "build_peak"
+
+    def route(self, state: StateSnapshot, task_snapshot: TaskSnapshot) -> Optional[str]:
+        """
+        纯函数路由 - 基于快照的成本感知路由
+        v7.6 特性：确定性路由决策
+        """
+        if not state.workers:
+            return None
+
+        available_workers = [w for w in state.workers if w.is_available]
+        if not available_workers:
+            return None
+
+        estimated_cost = task_snapshot.estimated_cost
+
+        if estimated_cost < 2.0:
+            # 便宜任务 → 负载最低
+            best = min(available_workers, key=lambda w: w.load)
+        else:
+            # 昂贵任务 → 空闲Worker优先
+            idle_workers = [w for w in available_workers if w.load < 0.3]
+            if idle_workers:
+                best = min(idle_workers, key=lambda w: w.load)
+            else:
+                best = min(available_workers, key=lambda w: w.load)
+
+        return best.worker_id if best else None
 
     def route_task(self, task: Task) -> Optional[str]:
         """
@@ -1548,6 +1926,9 @@ class ExecutionEngine:
             cost_tracker=self.cost_tracker,
             state_store=self.state_store
         )
+
+        # v7.6 快照构建器
+        self.snapshot_builder = StateSnapshotBuilder()
 
         self.max_iterations = 3
         self.convergence_threshold = 7.5

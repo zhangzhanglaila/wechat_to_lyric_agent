@@ -1,6 +1,6 @@
 """
-v7.5 Agent OS - Execution Gate Tests (No LLM)
-==============================================
+v7.6 Agent OS - State Snapshot Layer Tests
+============================================
 """
 
 import sys
@@ -8,60 +8,140 @@ sys.path.insert(0, '.')
 
 from agent_os import (
     Task, TaskPriority, TaskStatus,
-    DAGEngine, Scheduler, StateStore, LogicalClock,
-    AdaptiveCostTracker, ExecutionGate, GateDecision, WorkerType
+    StateSnapshot, StateSnapshotBuilder, ExecutionGate, GateDecision,
+    TaskSnapshot, WorkerSnapshot, QueueSnapshot, CostModelSnapshot,
+    LogicalClock, AdaptiveCostTracker
 )
 
 
-def test_execution_gate_health():
-    """测试 System Health Score"""
+def test_frozen_dataclasses():
+    """测试不可变数据结构"""
     print("=" * 50)
-    print("Execution Gate - System Health")
+    print("Frozen Data Classes")
     print("=" * 50)
 
-    clock = LogicalClock()
-    state_store = StateStore(clock)
-    cost_tracker = AdaptiveCostTracker()
-    dag = DAGEngine()
-    scheduler = Scheduler(dag, cost_tracker)
+    # TaskSnapshot
+    task = TaskSnapshot(
+        id="t1",
+        agent_type="writer",
+        priority=2,
+        dependencies=frozenset(),
+        estimated_cost=3.0,
+        depth=0,
+        status="READY",
+        created_at=0
+    )
 
-    # Mock worker pool
-    class MockWorkerPool:
-        def get_system_load(self): return 0.3
-        def get_worker_stats(self): return []
+    print(f"  TaskSnapshot: {task.id}, cost={task.estimated_cost}")
+    print(f"  TaskSnapshot hashable: {hash(task) is not None}")
 
-    gate = ExecutionGate(scheduler, MockWorkerPool(), cost_tracker, state_store)
+    # WorkerSnapshot
+    worker = WorkerSnapshot(
+        worker_id="w1",
+        worker_type="llm",
+        load=0.5,
+        capacity=1.0,
+        tasks_completed=10,
+        is_available=True
+    )
+    print(f"  WorkerSnapshot: {worker.worker_id}, load={worker.load}")
 
-    health = gate.get_system_health()
-    print(f"  Initial health: {health:.3f}")
+    # QueueSnapshot
+    queue = QueueSnapshot(
+        ready_count=5,
+        delayed_count=0,
+        running_count=2,
+        completed_count=100,
+        failed_count=1
+    )
+    print(f"  QueueSnapshot: ready={queue.ready_count}")
 
-    breakdown = gate.get_health_breakdown()
-    print(f"  Breakdown: {breakdown}")
+    # CostModelSnapshot
+    cost = CostModelSnapshot(
+        agent_types=frozenset(["writer", "critic"]),
+        cost_error=0.2,
+        total_observations=50
+    )
+    print(f"  CostModel: error={cost.cost_error}")
 
-    assert 0.0 <= health <= 1.0
     print("  [PASS]")
 
 
-def test_gate_decision_accept():
-    """测试 Gate 接受决策"""
+def test_state_snapshot():
+    """测试 StateSnapshot"""
     print("\n" + "=" * 50)
-    print("Gate Decision - Accept")
+    print("State Snapshot")
     print("=" * 50)
 
-    clock = LogicalClock()
-    state_store = StateStore(clock)
-    cost_tracker = AdaptiveCostTracker()
-    dag = DAGEngine()
-    scheduler = Scheduler(dag, cost_tracker)
+    workers = frozenset([
+        WorkerSnapshot("w1", "llm", 0.3, 1.0, 10, True),
+        WorkerSnapshot("w2", "llm", 0.7, 1.0, 5, True),
+    ])
 
-    class MockWorkerPool:
-        def get_system_load(self): return 0.3
-        def get_worker_stats(self): return []
+    queue = QueueSnapshot(5, 0, 2, 100, 1)
+    cost = CostModelSnapshot(frozenset(["writer"]), 0.15, 30)
 
-    gate = ExecutionGate(scheduler, MockWorkerPool(), cost_tracker, state_store)
+    state = StateSnapshot(
+        timestamp=time.time(),
+        logical_time=10,
+        workers=workers,
+        queue=queue,
+        cost_model=cost,
+        load_threshold=0.8,
+        queue_high_water=10,
+        total_submissions=100,
+        total_rejections=5
+    )
 
-    task = Task(id="t1", agent_type="writer", input_data={}, priority=TaskPriority.NORMAL)
-    result = gate.evaluate(task)
+    print(f"  StateSnapshot hashable: {hash(state) is not None}")
+    print(f"  System load: {state.get_system_load():.3f}")
+    print(f"  Queue pressure: {state.get_queue_pressure():.3f}")
+    print(f"  Health: {state.compute_health():.3f}")
+
+    assert 0.0 <= state.compute_health() <= 1.0
+    print("  [PASS]")
+
+
+def test_gate_pure_function():
+    """测试 Gate 纯函数"""
+    print("\n" + "=" * 50)
+    print("Gate Pure Function")
+    print("=" * 50)
+
+    gate = ExecutionGate()
+
+    # 构建一个健康的系统快照
+    workers = frozenset([
+        WorkerSnapshot("w1", "llm", 0.3, 1.0, 10, True),
+    ])
+    queue = QueueSnapshot(3, 0, 1, 50, 0)
+    cost = CostModelSnapshot(frozenset(["writer"]), 0.1, 20)
+
+    healthy_state = StateSnapshot(
+        timestamp=time.time(),
+        logical_time=10,
+        workers=workers,
+        queue=queue,
+        cost_model=cost,
+        load_threshold=0.8,
+        queue_high_water=10,
+        total_submissions=50,
+        total_rejections=0
+    )
+
+    task = TaskSnapshot(
+        id="t1",
+        agent_type="writer",
+        priority=2,
+        dependencies=frozenset(),
+        estimated_cost=3.0,
+        depth=0,
+        status="READY",
+        created_at=0
+    )
+
+    # 评估
+    result = gate.evaluate(healthy_state, task)
 
     print(f"  Decision: {result.decision.value}")
     print(f"  Reason: {result.reason}")
@@ -72,24 +152,44 @@ def test_gate_decision_accept():
 
 
 def test_gate_reject_overload():
-    """测试过载拒绝"""
+    """测试 Gate 过载拒绝"""
     print("\n" + "=" * 50)
     print("Gate - Overload Reject")
     print("=" * 50)
 
-    clock = LogicalClock()
-    state_store = StateStore(clock)
-    cost_tracker = AdaptiveCostTracker()
-    dag = DAGEngine()
-    scheduler = Scheduler(dag, cost_tracker)
+    gate = ExecutionGate()
 
-    class MockWorkerPool:
-        def get_system_load(self): return 0.98
+    # 高负载系统
+    workers = frozenset([
+        WorkerSnapshot("w1", "llm", 0.98, 1.0, 100, True),
+    ])
+    queue = QueueSnapshot(10, 0, 5, 100, 10)
+    cost = CostModelSnapshot(frozenset(["writer"]), 0.1, 20)
 
-    gate = ExecutionGate(scheduler, MockWorkerPool(), cost_tracker, state_store)
+    overloaded_state = StateSnapshot(
+        timestamp=time.time(),
+        logical_time=10,
+        workers=workers,
+        queue=queue,
+        cost_model=cost,
+        load_threshold=0.8,
+        queue_high_water=10,
+        total_submissions=100,
+        total_rejections=50
+    )
 
-    task = Task(id="t1", agent_type="writer", input_data={})
-    result = gate.evaluate(task)
+    task = TaskSnapshot(
+        id="t1",
+        agent_type="writer",
+        priority=2,
+        dependencies=frozenset(),
+        estimated_cost=3.0,
+        depth=0,
+        status="READY",
+        created_at=0
+    )
+
+    result = gate.evaluate(overloaded_state, task)
 
     print(f"  Decision: {result.decision.value}")
     print(f"  Reason: {result.reason}")
@@ -99,140 +199,216 @@ def test_gate_reject_overload():
 
 
 def test_gate_delay_queue_full():
-    """测试队列满时延迟"""
+    """测试 Gate 队列满延迟"""
     print("\n" + "=" * 50)
-    print("Gate - Queue Delay")
+    print("Gate - Queue Full Delay")
     print("=" * 50)
 
-    clock = LogicalClock()
-    state_store = StateStore(clock)
-    cost_tracker = AdaptiveCostTracker()
-    dag = DAGEngine()
-    scheduler = Scheduler(dag, cost_tracker)
-    scheduler.set_high_water(2)
+    gate = ExecutionGate()
 
-    class MockWorkerPool:
-        def get_system_load(self): return 0.3
+    # 队列满
+    workers = frozenset([
+        WorkerSnapshot("w1", "llm", 0.5, 1.0, 10, True),
+    ])
+    queue = QueueSnapshot(12, 0, 3, 50, 2)  # ready=12 > high_water=10
+    cost = CostModelSnapshot(frozenset(["writer"]), 0.2, 20)
 
-    gate = ExecutionGate(scheduler, MockWorkerPool(), cost_tracker, state_store)
+    queue_full_state = StateSnapshot(
+        timestamp=time.time(),
+        logical_time=10,
+        workers=workers,
+        queue=queue,
+        cost_model=cost,
+        load_threshold=0.8,
+        queue_high_water=10,
+        total_submissions=100,
+        total_rejections=0
+    )
 
-    # Fill queue
-    for i in range(3):
-        t = Task(id=f"t{i}", agent_type="writer", input_data={}, priority=TaskPriority.NORMAL)
-        scheduler.submit(t)
+    # 普通任务
+    normal_task = TaskSnapshot(
+        id="t1",
+        agent_type="writer",
+        priority=2,
+        dependencies=frozenset(),
+        estimated_cost=3.0,
+        depth=0,
+        status="READY",
+        created_at=0
+    )
 
-    print(f"  Queue size: {scheduler.get_status()['ready']}")
+    result = gate.evaluate(queue_full_state, normal_task)
 
-    task = Task(id="new", agent_type="writer", input_data={})
-    result = gate.evaluate(task)
-
-    print(f"  Decision: {result.decision.value}")
-    print(f"  Reason: {result.reason}")
-
+    print(f"  Normal task decision: {result.decision.value}")
     assert result.decision == GateDecision.DELAY
+
+    # CRITICAL 任务
+    critical_task = TaskSnapshot(
+        id="t2",
+        agent_type="writer",
+        priority=4,  # CRITICAL
+        dependencies=frozenset(),
+        estimated_cost=3.0,
+        depth=0,
+        status="READY",
+        created_at=0
+    )
+
+    result2 = gate.evaluate(queue_full_state, critical_task)
+    print(f"  Critical task decision: {result2.decision.value}")
+    assert result2.decision == GateDecision.ACCEPT
+
     print("  [PASS]")
 
 
-def test_gate_critical_priority():
-    """测试关键任务绕过"""
+def test_gate_routing():
+    """测试 Gate 路由"""
     print("\n" + "=" * 50)
-    print("Gate - Critical Priority")
+    print("Gate Routing")
     print("=" * 50)
 
-    clock = LogicalClock()
-    state_store = StateStore(clock)
-    cost_tracker = AdaptiveCostTracker()
-    dag = DAGEngine()
-    scheduler = Scheduler(dag, cost_tracker)
-    scheduler.set_high_water(2)
+    gate = ExecutionGate()
 
-    class MockWorkerPool:
-        def get_system_load(self): return 0.3
+    workers = frozenset([
+        WorkerSnapshot("w1", "llm", 0.2, 1.0, 10, True),
+        WorkerSnapshot("w2", "llm", 0.8, 1.0, 50, True),
+    ])
 
-    gate = ExecutionGate(scheduler, MockWorkerPool(), cost_tracker, state_store)
+    queue = QueueSnapshot(3, 0, 1, 50, 0)
+    cost = CostModelSnapshot(frozenset(["writer"]), 0.1, 20)
 
-    # Fill queue
-    for i in range(3):
-        t = Task(id=f"t{i}", agent_type="writer", input_data={}, priority=TaskPriority.NORMAL)
-        scheduler.submit(t)
+    state = StateSnapshot(
+        timestamp=time.time(),
+        logical_time=10,
+        workers=workers,
+        queue=queue,
+        cost_model=cost,
+        load_threshold=0.8,
+        queue_high_water=10,
+        total_submissions=50,
+        total_rejections=0
+    )
 
-    # Critical task should bypass
-    critical = Task(id="critical", agent_type="writer", input_data={}, priority=TaskPriority.CRITICAL)
-    result = gate.evaluate(critical)
+    # 便宜任务
+    cheap_task = TaskSnapshot(
+        id="t1",
+        agent_type="title",
+        priority=1,
+        dependencies=frozenset(),
+        estimated_cost=1.0,
+        depth=0,
+        status="READY",
+        created_at=0
+    )
 
-    print(f"  Decision: {result.decision.value}")
-    print(f"  Reason: {result.reason}")
+    route = gate.route(state, cheap_task)
+    print(f"  Cheap task route: {route} (expected: w1 - lower load)")
 
-    assert result.decision == GateDecision.ACCEPT
-    print("  [PASS]")
+    # 昂贵任务
+    expensive_task = TaskSnapshot(
+        id="t2",
+        agent_type="writer",
+        priority=1,
+        dependencies=frozenset(),
+        estimated_cost=5.0,
+        depth=0,
+        status="READY",
+        created_at=0
+    )
 
-
-def test_health_breakdown():
-    """测试健康度明细"""
-    print("\n" + "=" * 50)
-    print("Health Breakdown")
-    print("=" * 50)
-
-    clock = LogicalClock()
-    state_store = StateStore(clock)
-    cost_tracker = AdaptiveCostTracker()
-    dag = DAGEngine()
-    scheduler = Scheduler(dag, cost_tracker)
-
-    class MockWorkerPool:
-        def get_system_load(self): return 0.4
-
-    gate = ExecutionGate(scheduler, MockWorkerPool(), cost_tracker, state_store)
-
-    # Record some costs
-    cost_tracker.record_actual_cost("writer", 2.5, True)
-    cost_tracker.record_actual_cost("writer", 3.5, True)
-
-    breakdown = gate.get_health_breakdown()
-
-    print(f"  Overall health: {breakdown['overall_health']:.3f}")
-    print(f"  Worker load score: {breakdown['worker_load_score']:.3f}")
-    print(f"  Queue score: {breakdown['queue_score']:.3f}")
-    print(f"  Cost model score: {breakdown['cost_model_score']:.3f}")
-    print(f"  Total submissions: {breakdown['total_submissions']}")
-    print(f"  Total rejections: {breakdown['total_rejections']}")
+    route2 = gate.route(state, expensive_task)
+    print(f"  Expensive task route: {route2}")
 
     print("  [PASS]")
 
 
-def test_system_structure():
-    """测试系统结构"""
+def test_snapshot_builder():
+    """测试快照构建器"""
     print("\n" + "=" * 50)
-    print("System Structure v7.5")
+    print("Snapshot Builder")
     print("=" * 50)
 
     from agent_os import AgentOSKernel
 
     kernel = AgentOSKernel()
+    builder = kernel.engine.snapshot_builder
 
-    state = kernel.get_state()
+    state = builder.build(
+        kernel.engine.scheduler,
+        kernel.engine.worker_pool,
+        kernel.engine.cost_tracker
+    )
 
-    print(f"  Execution Gate: {state.get('execution_gate', {})}")
-    print(f"  Scheduler: {state['scheduler']}")
-    print(f"  Worker Pool: {state['worker_pool']}")
-
-    health = kernel.get_system_health()
-    print(f"\n  System health: {health:.3f}")
+    print(f"  Snapshot logical_time: {state.logical_time}")
+    print(f"  Snapshot workers: {len(state.workers)}")
+    print(f"  Snapshot health: {state.compute_health():.3f}")
 
     kernel.shutdown()
+    print("  [PASS]")
+
+
+def test_deterministic_replay():
+    """测试确定性 replay（核心特性）"""
+    print("\n" + "=" * 50)
+    print("Deterministic Replay")
+    print("=" * 50)
+
+    gate = ExecutionGate()
+
+    # 固定系统状态
+    workers = frozenset([
+        WorkerSnapshot("w1", "llm", 0.4, 1.0, 10, True),
+    ])
+    queue = QueueSnapshot(5, 0, 2, 50, 0)
+    cost = CostModelSnapshot(frozenset(["writer"]), 0.15, 20)
+
+    state = StateSnapshot(
+        timestamp=1000.0,
+        logical_time=10,
+        workers=workers,
+        queue=queue,
+        cost_model=cost,
+        load_threshold=0.8,
+        queue_high_water=10,
+        total_submissions=50,
+        total_rejections=0
+    )
+
+    task = TaskSnapshot(
+        id="t1",
+        agent_type="writer",
+        priority=2,
+        dependencies=frozenset(),
+        estimated_cost=3.0,
+        depth=0,
+        status="READY",
+        created_at=0
+    )
+
+    # 多次评估应该得到相同结果
+    results = []
+    for _ in range(5):
+        r = gate.evaluate(state, task)
+        results.append(r.decision)
+
+    print(f"  5 evaluations: {[r.value for r in results]}")
+    assert len(set(results)) == 1, "Pure function should return same result"
 
     print("  [PASS]")
 
 
 if __name__ == "__main__":
-    test_execution_gate_health()
-    test_gate_decision_accept()
+    import time
+
+    test_frozen_dataclasses()
+    test_state_snapshot()
+    test_gate_pure_function()
     test_gate_reject_overload()
     test_gate_delay_queue_full()
-    test_gate_critical_priority()
-    test_health_breakdown()
-    test_system_structure()
+    test_gate_routing()
+    test_snapshot_builder()
+    test_deterministic_replay()
 
     print("\n" + "=" * 50)
-    print("ALL V7.5 TESTS PASSED")
+    print("ALL V7.6 TESTS PASSED")
     print("=" * 50)

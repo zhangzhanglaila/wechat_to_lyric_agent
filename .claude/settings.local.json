@@ -14,7 +14,9 @@
       "Bash(python -m py_compile agent_os/__init__.py)",
       "Bash(python -m py_compile \"D:\\\\wechat_to_lyric_agent\\\\agent_os\\\\__init__.py\")",
       "Bash(python test_agent_os.py)",
-      "Bash(python -c \"import agent_os; print\\('Import OK'\\)\")"
+      "Bash(python -c \"import agent_os; print\\('Import OK'\\)\")",
+      "Bash(python -c \"from agent_os import EnhancedAgentOS, ArtPipeline, EmotionVector, LyricRhythmSpec, ChatCompressionLayer; print\\('Import OK'\\)\")",
+      "Bash(python:*)"
     ]
   }
 }
