@@ -695,6 +695,9 @@ class HookGenerator:
         """
         style_config = StylePresetLibrary.get_preset(style) if style else None
 
+        # v8.4: 用最强情绪（而非主情绪），解决"局部 anger 爆发被整体 sadness 压制"的问题
+        profile_strength = max(vars(emotion).values())
+
         # 根据情绪选择 hook 类型
         hook_type = self._select_hook_type(emotion, emotion_curve)
 
@@ -703,16 +706,17 @@ class HookGenerator:
             hook_type, theme, emotion, imagery, style_config
         )
 
-        # v8.1: 应用人格到 Hook
+        # v8.1: 应用人格到 Hook（使用 profile_strength 统一控制）
         if profile:
-            hook = self._apply_profile_to_hook(hook, profile)
+            hook = self._apply_profile_to_hook(hook, profile, profile_strength)
 
         self.last_hook = hook
         return hook
 
-    def _apply_profile_to_hook(self, hook: str, profile: 'HumanProfile') -> str:
+    def _apply_profile_to_hook(self, hook: str, profile: 'HumanProfile', profile_strength: float = 1.0) -> str:
         """
         v8.1 核心：Hook 人格化
+        v8.3: Hook 概率与正文统一，使用 profile_strength
 
         让 Hook 和 Profile 对齐，解决"第一眼有性格"的问题
 
@@ -737,14 +741,15 @@ class HookGenerator:
         profile_type = profile.profile_type
 
         if profile_type == HumanProfileType.TSUNDERE:
-            # 嘴硬型：自打脸
-            if random.random() < 0.6:
+            # 嘴硬型：自打脸（v8.3: 概率 × profile_strength）
+            if random.random() < min(1.0, profile.correction * profile_strength):
                 prefixes = ["不是……", "好吧……", "……算了……"]
                 prefix = random.choice(prefixes)
-                return f"{HOOK_PREFIX} {prefix}{clean_hook}……{'没有' if random.random() < 0.5 else '吧'}"
+                suffix_prob = min(1.0, profile.hesitation * profile_strength)
+                return f"{HOOK_PREFIX} {prefix}{clean_hook}……{'没有' if random.random() < suffix_prob else '吧'}"
 
         elif profile_type == HumanProfileType.SUPPRESSED:
-            # 压抑型：换行，制造停顿感
+            # 压抑型：换行，制造停顿感（用 fragmentation 控制断句）
             if len(clean_hook) > 6:
                 words = clean_hook.split("，")
                 if len(words) >= 2:
@@ -754,27 +759,28 @@ class HookGenerator:
                 return f"{HOOK_PREFIX} {clean_hook[:mid]}\n{HOOK_PREFIX} {clean_hook[mid:]}"
 
         elif profile_type == HumanProfileType.DOWNWARD_SPIRAL:
-            # emo型：半句回收
-            if random.random() < 0.7 and len(clean_hook) > 4:
+            # emo型：半句回收（v8.3: 概率 × profile_strength）
+            prob = min(1.0, profile.repetition * profile_strength)
+            if random.random() < prob and len(clean_hook) > 4:
                 # 取后半句关键词
                 suffix = clean_hook[-3:] if len(clean_hook) > 3 else clean_hook
                 return f"{HOOK_PREFIX} {clean_hook}\n{HOOK_PREFIX} {suffix}"
 
         elif profile_type == HumanProfileType.CALM_COLLAPSE:
-            # 冷静崩溃型：理性开头 → 崩
-            if random.random() < 0.6:
+            # 冷静崩溃型：理性开头 → 崩（v8.3: 概率 × profile_strength）
+            if random.random() < min(1.0, profile.correction * profile_strength):
                 return f"{HOOK_PREFIX} 我以为我已经{clean_hook}……但没有"
             return f"{HOOK_PREFIX} 我以为{clean_hook}……其实没有"
 
         elif profile_type == HumanProfileType.NOSTALGIC:
-            # 怀旧型：加时间感
-            if random.random() < 0.5:
+            # 怀旧型：加时间感（v8.3: 概率 × profile_strength）
+            if random.random() < min(1.0, profile.hesitation * profile_strength):
                 return f"{HOOK_PREFIX} 那年，{clean_hook}"
             return f"{HOOK_PREFIX} {clean_hook}的时候"
 
         elif profile_type == HumanProfileType.RESIGNED:
-            # 认命型：无奈收尾
-            if random.random() < 0.5:
+            # 认命型：无奈收尾（v8.3: 概率 × profile_strength）
+            if random.random() < min(1.0, profile.hesitation * profile_strength):
                 return f"{HOOK_PREFIX} {clean_hook}……算了"
             return f"{HOOK_PREFIX} {clean_hook}……就这样吧"
 
@@ -1076,7 +1082,6 @@ class HumanRewriteLayer:
 
         lines = lyrics.split("\n")
         humanized_lines = []
-        prefix_used_this_section = False  # v8.1: 每段最多1次prefix
 
         for i, line in enumerate(lines):
             # 跳过空行
@@ -1099,15 +1104,10 @@ class HumanRewriteLayer:
                 emotion_weight, emotion_curve_position, i, len(lines)
             )
 
-            # ✅ 应用人格驱动的噪声（使用profile_strength）
-            line = self._apply_profile_driven_noise(
-                line, profile_strength, line_emotion_weight, active_profile,
-                prefix_used=prefix_used_this_section
+            # ✅ v9.0 语义驱动 Rewrite（替代概率驱动的 _apply_profile_driven_noise）
+            line = self.rewrite_line(
+                line, line_emotion_weight, active_profile, profile_strength
             )
-
-            # v8.1: 跟踪prefix使用
-            if "，" in line and any(p in line for p in active_profile.prefix_patterns):
-                prefix_used_this_section = True
 
             humanized_lines.append(line)
 
@@ -1152,12 +1152,13 @@ class HumanRewriteLayer:
         emotion_weight: float,
         profile: HumanProfile,
         prefix_used: bool = False
-    ) -> str:
+    ) -> tuple:
         """
         人格驱动的噪声应用 v8.1
 
         根据人格配置控制不同噪声类型的权重
         v8.1: 使用 profile_strength（intensity × emotion_weight）
+        v8.2: 返回 (line, used_prefix) tuple，消除弱检测
 
         人格影响：
         - tsundere: correction权重高（自打脸）
@@ -1170,17 +1171,18 @@ class HumanRewriteLayer:
         if emotion_weight < 0.3:
             if random.random() < intensity * profile.hesitation * 0.3:
                 return self._add_profile_filler(line, profile, used_prefix=prefix_used)
-            return line
+            return line, prefix_used
 
         # 情绪中等：应用人格特征
         if emotion_weight < 0.6:
             # hesitation（只有没用过prefix时才用）
             if not prefix_used and random.random() < intensity * profile.hesitation * 0.4:
-                line = self._add_profile_filler(line, profile, used_prefix=False)
+                line, used = self._add_profile_filler(line, profile, used_prefix=False)
+                prefix_used = prefix_used or used
             # fragmentation
             if random.random() < intensity * profile.fragmentation * 0.3:
                 line = self._add_profile_break(line, profile)
-            return line
+            return line, prefix_used
 
         # 情绪高：应用所有噪声
         # fragmentation（断句）- suppressed型最强
@@ -1197,34 +1199,40 @@ class HumanRewriteLayer:
 
         # hesitation（语气词）- 所有类型都适用
         if random.random() < intensity * profile.hesitation * 0.4:
-            line = self._add_profile_filler(line, profile)
+            line, used = self._add_profile_filler(line, profile)
+            prefix_used = prefix_used or used
 
-        return line
+        return line, prefix_used
 
-    def _add_profile_filler(self, line: str, profile: HumanProfile, used_prefix: bool = False) -> str:
-        """根据人格添加语气词"""
+    def _add_profile_filler(self, line: str, profile: HumanProfile, used_prefix: bool = False) -> tuple:
+        """
+        根据人格添加语气词
+
+        Returns:
+            (new_line, used_prefix): 返回新行和是否使用了prefix
+        """
         import random
         clean = line.strip()
         if len(clean) < 4:
-            return line
+            return line, False
 
         # v8.1: 只有没用过prefix时才用前缀模式
         # 且概率降低（0.3而非0.4）
         if profile.prefix_patterns and not used_prefix and random.random() < 0.3:
             prefix = random.choice(profile.prefix_patterns)
             if clean.startswith(("不", "没", "别", "我", "你", "他")):
-                return f"{prefix}，{clean}"
-            return f"{prefix}，{clean}"
+                return f"{prefix}，{clean}", True
+            return f"{prefix}，{clean}", True
 
         # 标准语气词（轻微停顿）
         fillers = ["……", "嗯", "就", "其实"]
         filler = random.choice(fillers)
 
         if clean.endswith(("，", "。")):
-            return clean[:-1] + f"{filler}，"
+            return clean[:-1] + f"{filler}，", False
         elif len(clean) > 5 and random.random() < 0.2:
-            return clean + f"，{filler}"
-        return clean
+            return clean + f"，{filler}", False
+        return clean, False
 
     def _add_profile_break(self, line: str, profile: HumanProfile) -> str:
         """根据人格添加断句"""
@@ -1407,6 +1415,283 @@ class HumanRewriteLayer:
             if not clean.endswith("……"):
                 return clean + suffix
 
+        return line
+
+    # ==================== v9.0 语义驱动 Rewrite ====================
+
+    # 自我矛盾模板库（情绪峰值触发）
+    CONTRADICTION_TEMPLATES = [
+        "我以为我已经{state}了……但没有",
+        "我说不在意，其实{truth}",
+        "不是因为{reason}，只是{truth}",
+        "我早就{state}了——至少我以为",
+    ]
+
+    # 说不清楚模板（人类错误感）
+    VAGUE_TEMPLATES = [
+        "我也不知道为什么，就是觉得",
+        "好像有点不对",
+        "说不上来",
+        "就是突然觉得……好像不太对了",
+    ]
+
+    def rewrite_line(
+        self,
+        line: str,
+        emotion_weight: float,
+        profile: HumanProfile,
+        profile_strength: float
+    ) -> str:
+        """
+        v9.0 语义驱动的人类化Rewrite管线
+
+        顺序很重要：
+        1. 语义停顿（情绪转折 / 未说完 / 自我修正）
+        2. 自我否定（峰值 + 语义触发）
+        3. 不对称（打断对称结构）
+        4. 轻微卡顿（情绪犹豫时）
+
+        每个步骤都有语义条件，概率只做兜底
+        """
+        import random
+
+        # 1. 语义停顿（规则优先）
+        line = self._apply_semantic_pause(line, profile)
+
+        # 2. 自我否定（情绪峰值触发）
+        if emotion_weight > 0.6:
+            line = self._apply_contradiction(line, emotion_weight, profile)
+
+        # 3. 不对称句式（打破AI工整感）
+        if emotion_weight > 0.4:
+            line = self._apply_asymmetry(line, profile)
+
+        # 4. 轻微卡顿（犹豫/后悔情绪时）
+        if emotion_weight > 0.3 and profile.hesitation > 0.3:
+            line = self._apply_imperfect_repetition(line, profile)
+
+        # 5. 兜底：概率驱动的人格噪声（原有逻辑）
+        if random.random() < profile_strength * 0.3:
+            line = self._apply_probability_filler(line, profile)
+
+        return line
+
+    def _apply_semantic_pause(self, line: str, profile: HumanProfile) -> str:
+        """
+        语义停顿：只在情绪转折处停顿，不随机乱插
+
+        触发位置：
+        1. 情绪转折前（但/可是/只是/其实）
+        2. 句子未说完（想/要/该）
+        3. 自我修正（不是/应该说）
+        """
+        import random
+        clean = line.strip()
+        if len(clean) < 4:
+            return line
+
+        # 已经在句尾有省略号的跳过
+        if clean.endswith("……"):
+            return line
+
+        # 情绪转折前 → 停顿
+        turn_words = ["但", "可是", "只是", "其实", "不过"]
+        for word in turn_words:
+            if word in clean:
+                idx = clean.find(word)
+                if idx > 2:  # 不是在开头
+                    before = clean[:idx]
+                    after = clean[idx:]
+                    if len(before) > 2 and len(after) > 1:
+                        # 只在转折词前加省略号，不破坏转折词本身
+                        if random.random() < 0.6:
+                            return f"{before}……{after}"
+                    break
+
+        # 句子未说完（以"想""要""该"开头或附近）
+        unfinished_patterns = ["我想", "我要", "我该", "我应该", "其实我想"]
+        for pattern in unfinished_patterns:
+            if clean.startswith(pattern) and len(clean) > 6:
+                # 句中某个位置截断 + 省略号
+                if random.random() < 0.5:
+                    mid = len(clean) // 2
+                    return clean[:mid] + "……"
+                return clean + "……"
+                break
+
+        # 自我修正（句中有"不是"但没有"……"）
+        if "不是" in clean and "……" not in clean and random.random() < 0.4:
+            idx = clean.find("不是")
+            if idx >= 0:
+                return clean[:idx] + "不是……" + clean[idx+2:]
+
+        return line
+
+    def _apply_contradiction(self, line: str, emotion_weight: float, profile: HumanProfile) -> str:
+        """
+        自我否定：情绪峰值(>0.6) + 语义触发词 → 使用矛盾模板
+
+        核心：不是随机，是"情绪到位了才有"
+        """
+        import random
+        clean = line.strip()
+        if len(clean) < 4:
+            return line
+
+        # 已经处理过的跳过
+        if "……但没有" in clean or "——至少我以为" in clean or "其实" in clean[:4]:
+            return line
+
+        # 语义触发词
+        trigger_words = ["以为", "放下", "忘记", "不在意", "算了", "该忘"]
+        triggered = any(w in clean for w in trigger_words)
+
+        if not triggered:
+            return line
+
+        # 概率：emotion_weight越高越容易触发
+        prob = emotion_weight * profile.correction
+        if random.random() > prob:
+            return line
+
+        # 提取 state 或 truth
+        for keyword in trigger_words:
+            if keyword in clean:
+                idx = clean.find(keyword)
+                state = clean[idx:idx+3] if idx + 3 <= len(clean) else clean[idx:]
+                templates = [
+                    f"我以为我已经{state}了……但没有",
+                    f"我说不在意，其实{state}",
+                ]
+                chosen = random.choice(templates)
+                # 替换占位符
+                if "{state}" in chosen:
+                    chosen = chosen.replace("{state}", state.rstrip("了"))
+                return chosen
+                break
+
+        return line
+
+    def _apply_asymmetry(self, line: str, profile: HumanProfile) -> str:
+        """
+        不对称句式：打破AI的工整对仗感
+
+        AI 容易写成：
+        你走了，我哭了
+        你不在，我难过了
+
+        人类写法：
+        你走了
+        我后来才开始哭
+        或者：
+        你走了，我哭了
+        只是后来才意识到
+        """
+        import random
+        clean = line.strip()
+        if len(clean) < 8:
+            return line
+
+        # 检测对称结构："你...，我..."
+        对称模式 = ["你", "我"]
+        逗号_count = clean.count("，")
+
+        if 逗号_count >= 1 and random.random() < profile.fragmentation * 0.4:
+            parts = clean.split("，")
+            if len(parts) >= 2:
+                first = parts[0].strip()
+                second = "，".join(parts[1:]).strip()
+
+                # 如果前后都是"你/我"开头，打破它
+                if (first.startswith("你") or first.startswith("我")) and \
+                   (second.startswith("你") or second.startswith("我")):
+                    # 方案：前半保留，后半加"延迟句"
+                    延迟词 = ["只是", "后来才", "过了很久才", "其实"]
+                    if random.random() < 0.5:
+                        delay = random.choice(延迟词)
+                        return f"{first}，{delay}{second[1:]}"
+
+                    # 方案：直接断句，让信息延迟
+                    if len(first) > 2 and len(second) > 2:
+                        return f"{first}\n{second}"
+
+        # 检测平行结构（"了...了..."）
+        if "了" in clean and "，" in clean and random.random() < 0.3:
+            parts = clean.split("，")
+            if len(parts) >= 2:
+                # 找"了"的位置，让第二句信息更模糊
+                if "了" in parts[0] and len(parts) > 1:
+                    parts[1] = parts[1].replace("了", "……")
+                    return "，".join(parts)
+
+        return line
+
+    def _apply_imperfect_repetition(self, line: str, profile: HumanProfile) -> str:
+        """
+        轻微重复（卡顿感）：不是复读，而是"卡住"
+
+        我想说的是
+        想说的不是
+        这样
+
+        或者：
+        你问我还在不在
+        我说在
+        其实……
+        """
+        import random
+        clean = line.strip()
+        if len(clean) < 6:
+            return line
+
+        # 已经处理过的跳过
+        重复词 = ["想说", "要说", "想问", "想说"]
+        if any(w in clean for w in 重复词):
+            for word in 重复词:
+                if word in clean:
+                    idx = clean.find(word)
+                    if idx >= 0:
+                        before = clean[:idx]
+                        rest = clean[idx:]
+                        # 只重复前两个字
+                        partial = rest[:min(3, len(rest))]
+                        templates = [
+                            f"{before}{partial}，{rest}",
+                            f"{before}{partial}……{rest}",
+                        ]
+                        if random.random() < profile.repetition * 0.5:
+                            return random.choice(templates)
+                    break
+
+        # 句尾关键词重复（卡住感）
+        for kw in profile.echo_keywords:
+            if kw in clean and len(clean) > 5:
+                idx = clean.rfind(kw)
+                if idx > 2 and random.random() < profile.repetition * 0.3:
+                    before = clean[:idx]
+                    after = clean[idx:]
+                    return f"{before}……{after}"
+                    break
+
+        return line
+
+    def _apply_probability_filler(self, line: str, profile: HumanProfile) -> str:
+        """
+        兜底：概率驱动的人格语气词
+        只有语义触发都没命中时才走这里
+        """
+        import random
+        clean = line.strip()
+        if len(clean) < 4:
+            return line
+
+        # 轻微语气词
+        if random.random() < profile.hesitation * 0.4:
+            filler = random.choice(["……", "嗯", "就", "其实"])
+            if clean.endswith(("，", "。")):
+                return clean[:-1] + f"{filler}，"
+            elif len(clean) > 5:
+                return clean + f"，{filler}"
         return line
 
     def _apply_echo_enhancement(
@@ -2015,8 +2300,11 @@ class ArtPipeline:
 
         pos = hook_positions.get(curve, -1)
 
-        # 构建 hook 行
-        hook_line = f"\n{HOOK_PREFIX} {hook}\n"
+        # 构建 hook 行（防止双 prefix：_apply_profile_to_hook 已加过）
+        # 只判断开头，不扫全文，避免内容本身含"!"被误判
+        if not hook.lstrip().startswith((HOOK_PREFIX, "!")):
+            hook = f"{HOOK_PREFIX} {hook}"
+        hook_line = f"\n{hook}\n"
 
         if 0 <= pos < len(lines):
             lines.insert(pos, hook_line)
