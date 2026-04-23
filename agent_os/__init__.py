@@ -1,15 +1,41 @@
 """
-v7.4 Agent OS - Stable Scheduler
-=================================
-核心升级：系统稳定性语义
+v7.5 Agent OS - Execution Gate + System Health
+============================================
+核心升级：统一执行门控层
 
-v7.3 → v7.4：
-1. Backpressure + Admission Control - 防止系统过载
-2. Adaptive Cost Model - 动态成本估计
-3. Resource Model - Worker 真实负载追踪
+v7.4 → v7.5：
+1. Execution Gate - 统一的任务入口和准入控制
+2. System Health Score - 系统健康度量化
+3. Global Feedback Loop - 执行结果闭环反馈
 
-从 "Deterministic + Explainable Scheduler Prototype"
-到 "Stable Production-Ready Scheduler"
+从 "分散控制点" → "统一执行门控"
+
+系统架构：
+                ┌─────────────────────┐
+                │   Agent Layer       │
+                └──────────┬──────────┘
+                           │
+                ┌──────────▼──────────┐
+                │   Execution Gate    │  ← v7.5 统一入口
+                │  (control plane)    │
+                └──────────┬──────────┘
+                           │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+┌───────▼───────┐  ┌───────▼───────┐  ┌───────▼───────┐
+│   Admission   │  │  Backpressure │  │    Cost       │
+│   Control     │  │   Control     │  │    Model      │
+└───────────────┘  └───────────────┘  └───────────────┘
+                           │
+                ┌──────────▼──────────┐
+                │   Scheduler v7.4    │
+                │  (decision layer)   │
+                └──────────┬──────────┘
+                           │
+                ┌──────────▼──────────┐
+                │    WorkerPool        │
+                │  (execution layer)   │
+                └─────────────────────┘
 """
 
 import os
@@ -36,8 +62,8 @@ MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-chat")
 MAX_WORKERS = int(os.getenv("MAX_AGENTS", "3"))
 
 # 调度配置
-DEFAULT_LOAD_THRESHOLD = 0.8  # 负载阈值，超过则拒绝新任务
-DEFAULT_QUEUE_HIGH_WATER = 10  # 队列高水位
+DEFAULT_LOAD_THRESHOLD = 0.8
+DEFAULT_QUEUE_HIGH_WATER = 10
 
 
 # ==================== LLM ====================
@@ -63,7 +89,8 @@ class TaskStatus(Enum):
     RUNNING = "running"
     COMPLETE = "complete"
     FAILED = "failed"
-    DELAYED = "delayed"  # v7.4 新增：因背压被延迟
+    DELAYED = "delayed"
+    REJECTED = "rejected"  # v7.5 新增
 
 
 class TaskPriority(Enum):
@@ -73,18 +100,27 @@ class TaskPriority(Enum):
     CRITICAL = 4
 
 
+class GateDecision(Enum):
+    """Execution Gate 决策"""
+    ACCEPT = "accept"      # 接受执行
+    DELAY = "delay"       # 延迟执行
+    REJECT = "reject"      # 拒绝执行
+
+
 class RuntimeEvent(Enum):
     TASK_SUBMITTED = auto()
     TASK_READY = auto()
     TASK_STARTED = auto()
     TASK_COMPLETE = auto()
     TASK_FAILED = auto()
-    TASK_DELAYED = auto()  # v7.4
+    TASK_DELAYED = auto()
+    TASK_REJECTED = auto()    # v7.5
     WORKER_SUBMITTED = auto()
     WORKER_COMPLETE = auto()
     SCHEDULING_DECISION = auto()
-    ADMISSION_REJECTED = auto()  # v7.4
-    BACKPRESSURE_TRIGGERED = auto()  # v7.4
+    ADMISSION_REJECTED = auto()
+    BACKPRESSURE_TRIGGERED = auto()
+    GATE_DECISION = auto()    # v7.5
 
 
 class WorkerType(Enum):
@@ -115,8 +151,8 @@ class Task:
     depth: int = 0
     worker_type: WorkerType = WorkerType.GENERAL
 
-    # v7.4 新增：实际成本追踪
-    actual_cost: float = 0.0  # 实际执行时间
+    # 实际成本追踪
+    actual_cost: float = 0.0
     execution_start: Optional[float] = None
 
     def __hash__(self):
@@ -142,6 +178,17 @@ class Snapshot:
 
 
 @dataclass
+class GateResult:
+    """Execution Gate 决策结果"""
+    decision: GateDecision
+    task_id: str
+    reason: str
+    health_score: float  # 决策时的健康度
+    queue_position: Optional[int] = None
+    delay_seconds: float = 0.0
+
+
+@dataclass
 class SchedulingDecision:
     timestamp: float
     task_id: str
@@ -151,7 +198,8 @@ class SchedulingDecision:
     priority: int = 0
     estimated_cost: float = 0
     depth: int = 0
-    admitted: bool = True  # v7.4：是否被准入
+    admitted: bool = True
+    health_score: float = 1.0  # v7.5
 
 
 @dataclass
@@ -394,68 +442,58 @@ class StateStore:
         }
 
 
-# ==================== Adaptive Cost Tracker（v7.4 新增） ====================
+# ==================== Adaptive Cost Tracker ====================
 
 class AdaptiveCostTracker:
     """
     Adaptive Cost Tracker - 自适应成本估计
-    ====================
-    v7.4 核心组件：
-
-    静态估计 → 动态学习
-
-    根据实际执行时间更新成本模型
-    支持不同任务类型的差异化估计
     """
-
     def __init__(self):
-        # 成本历史：agent_type -> List[actual_cost]
         self._cost_history: Dict[str, List[float]] = {}
         self._lock = threading.Lock()
-
-        # 默认成本
         self._default_costs = {
             "writer": 3.0,
             "critic": 2.0,
             "editor": 2.5,
             "title": 1.0,
         }
-
-        # EMA 衰减因子（越接近实际越新）
         self._ema_alpha = 0.3
 
     def get_estimated_cost(self, agent_type: str) -> float:
-        """获取估计成本（优先用学习到的值）"""
         with self._lock:
             if agent_type in self._cost_history and self._cost_history[agent_type]:
                 history = self._cost_history[agent_type]
-                # 使用 EMA
                 ema = history[0]
                 for cost in history[1:]:
                     ema = self._ema_alpha * cost + (1 - self._ema_alpha) * ema
-                return max(ema, 0.1)  # 最小成本
+                return max(ema, 0.1)
             return self._default_costs.get(agent_type, 1.0)
 
     def record_actual_cost(self, agent_type: str, actual_cost: float, task_success: bool):
-        """
-        记录实际成本（仅成功任务）
-        v7.4 核心：反馈学习
-        """
         if not task_success or actual_cost <= 0:
             return
-
         with self._lock:
             if agent_type not in self._cost_history:
                 self._cost_history[agent_type] = []
-
             self._cost_history[agent_type].append(actual_cost)
-
-            # 保留最近 50 条记录
             if len(self._cost_history[agent_type]) > 50:
                 self._cost_history[agent_type] = self._cost_history[agent_type][-50:]
 
+    def get_cost_error(self) -> float:
+        """计算成本估计误差（用于健康度）"""
+        with self._lock:
+            total_error = 0.0
+            count = 0
+            for agent_type, history in self._cost_history.items():
+                if history:
+                    default = self._default_costs.get(agent_type, 1.0)
+                    avg = sum(history) / len(history)
+                    error = abs(avg - default) / default
+                    total_error += error
+                    count += 1
+            return total_error / max(count, 1)
+
     def get_learning_stats(self) -> Dict:
-        """获取学习统计"""
         with self._lock:
             stats = {}
             for agent_type, history in self._cost_history.items():
@@ -562,10 +600,6 @@ class DAGEngine:
     def get_completed_count(self) -> int:
         return len(self._completed)
 
-    def get_task_depth(self, task_id: str) -> int:
-        with self._lock:
-            return self._task_depths.get(task_id, 0)
-
     def has_cycle(self) -> bool:
         with self._lock:
             visited = set()
@@ -596,23 +630,221 @@ class DAGEngine:
             }
 
 
-# ==================== Scheduler（Backpressure + Admission Control） ====================
+# ==================== Execution Gate（v7.5 核心） ====================
+
+class ExecutionGate:
+    """
+    Execution Gate - 统一执行门控
+    ====================
+    v7.5 核心组件：所有任务进入系统的统一入口
+
+    职责：
+    1. System Health Score - 计算系统健康度
+    2. Unified Admission - 统一的准入控制
+    3. Cost-aware Routing - 成本感知路由
+    4. Global Feedback - 收集反馈更新模型
+    """
+
+    def __init__(
+        self,
+        scheduler: 'Scheduler',
+        worker_pool: 'WorkerPool',
+        cost_tracker: AdaptiveCostTracker,
+        state_store: StateStore
+    ):
+        self.scheduler = scheduler
+        self.worker_pool = worker_pool
+        self.cost_tracker = cost_tracker
+        self.state_store = state_store
+
+        # 配置
+        self.load_threshold = DEFAULT_LOAD_THRESHOLD
+        self.queue_high_water = DEFAULT_QUEUE_HIGH_WATER
+        self.health_weight_load = 0.4
+        self.health_weight_queue = 0.3
+        self.health_weight_cost_error = 0.2
+        self.health_weight_rejection = 0.1
+
+        # 统计
+        self._total_submissions = 0
+        self._total_rejections = 0
+        self._decision_history: List[GateResult] = []
+
+        self._lock = threading.Lock()
+
+    def get_system_health(self) -> float:
+        """
+        计算系统健康度（0.0 ~ 1.0）
+        ====================
+        health = f(
+            worker_load,      # 越低越好
+            queue_size,       # 越小越好
+            cost_error,       # 成本估计误差，越小越好
+            rejection_rate    # 拒绝率，越低越好
+        )
+        """
+        with self._lock:
+            # 1. Worker 负载（越低越好）
+            system_load = self.worker_pool.get_system_load()
+            load_score = 1.0 - system_load  # 0.0 满载 → 1.0 空闲
+
+            # 2. 队列大小（越小越好）
+            queue_size = self.scheduler.get_status()["ready"]
+            queue_score = max(0.0, 1.0 - queue_size / max(self.queue_high_water, 1))
+
+            # 3. 成本估计误差（越小越好）
+            cost_error = self.cost_tracker.get_cost_error()
+            cost_score = max(0.0, 1.0 - cost_error)
+
+            # 4. 拒绝率（越低越好）
+            rejection_rate = (
+                self._total_rejections / max(self._total_submissions, 1)
+            )
+            rejection_score = 1.0 - rejection_rate
+
+            # 加权健康度
+            health = (
+                self.health_weight_load * load_score +
+                self.health_weight_queue * queue_score +
+                self.health_weight_cost_error * cost_score +
+                self.health_weight_rejection * rejection_score
+            )
+
+            return max(0.0, min(1.0, health))
+
+    def evaluate(self, task: Task) -> GateResult:
+        """
+        评估任务是否可接受（统一门控）
+        ====================
+        v7.5 核心：单一入口，统一决策
+        """
+        with self._lock:
+            self._total_submissions += 1
+            health = self.get_system_health()
+
+            # 决策因素
+            system_load = self.worker_pool.get_system_load()
+            queue_size = self.scheduler.get_status()["ready"]
+            queue_total = queue_size + len(self.scheduler._delayed_queue)
+
+            # 决策逻辑
+            if system_load >= 0.95:
+                # 极端过载 → 拒绝
+                self._total_rejections += 1
+                decision = GateDecision.REJECT
+                reason = f"system overload: load={system_load:.2f}"
+                self._log_decision(task.id, decision, reason, health)
+
+            elif queue_total >= self.queue_high_water:
+                # 队列过满 → 根据优先级决定
+                if task.priority == TaskPriority.CRITICAL:
+                    decision = GateDecision.ACCEPT
+                    reason = f"critical task bypasses queue limit"
+                else:
+                    decision = GateDecision.DELAY
+                    reason = f"queue full: {queue_total} >= {self.queue_high_water}"
+                    self._log_decision(task.id, decision, reason, health)
+            else:
+                # 正常 → 接受
+                decision = GateDecision.ACCEPT
+                reason = f"healthy: load={system_load:.2f}, queue={queue_total}"
+                self._log_decision(task.id, decision, reason, health)
+
+            return GateResult(
+                decision=decision,
+                task_id=task.id,
+                reason=reason,
+                health_score=health
+            )
+
+    def route_task(self, task: Task) -> Optional[str]:
+        """
+        成本感知路由
+        ====================
+        v7.5：cheap task → low load worker
+              expensive task → idle worker
+        """
+        workers = self.worker_pool.get_worker_stats()
+
+        if not workers:
+            return None
+
+        estimated_cost = task.estimated_cost
+
+        # 根据成本选择
+        if estimated_cost < 2.0:
+            # 便宜任务 → 选择负载最低的
+            best = min(workers, key=lambda w: w["load"])
+        else:
+            # 昂贵任务 → 选择最空闲的（负载<0.3）
+            idle_workers = [w for w in workers if w["load"] < 0.3]
+            if idle_workers:
+                best = idle_workers[0]
+            else:
+                best = min(workers, key=lambda w: w["load"])
+
+        return best["worker_id"] if best else None
+
+    def on_task_complete(self, task_id: str, score: float, actual_cost: float, success: bool):
+        """任务完成回调：更新成本模型"""
+        # 成本追踪已由 Scheduler 处理
+        pass
+
+    def _log_decision(self, task_id: str, decision: GateDecision, reason: str, health: float):
+        self.state_store.log_trace(
+            RuntimeEvent.GATE_DECISION,
+            task_id,
+            "execution_gate",
+            {
+                "decision": decision.value,
+                "reason": reason,
+                "health": health
+            }
+        )
+
+        self._decision_history.append(GateResult(
+            decision=decision,
+            task_id=task_id,
+            reason=reason,
+            health_score=health
+        ))
+
+        # 保留最近 100 条
+        if len(self._decision_history) > 100:
+            self._decision_history = self._decision_history[-100:]
+
+    def get_health_breakdown(self) -> Dict:
+        """获取健康度明细"""
+        system_load = self.worker_pool.get_system_load()
+        queue_size = self.scheduler.get_status()["ready"]
+        cost_error = self.cost_tracker.get_cost_error()
+        rejection_rate = (
+            self._total_rejections / max(self._total_submissions, 1)
+        )
+
+        return {
+            "overall_health": self.get_system_health(),
+            "worker_load_score": 1.0 - system_load,
+            "queue_score": max(0.0, 1.0 - queue_size / max(self.queue_high_water, 1)),
+            "cost_model_score": max(0.0, 1.0 - cost_error),
+            "rejection_score": 1.0 - rejection_rate,
+            "total_submissions": self._total_submissions,
+            "total_rejections": self._total_rejections
+        }
+
+    def get_gate_stats(self) -> Dict:
+        """获取门控统计"""
+        return {
+            "total_submissions": self._total_submissions,
+            "total_rejections": self._total_rejections,
+            "rejection_rate": self._total_rejections / max(self._total_submissions, 1),
+            "recent_decisions": len(self._decision_history)
+        }
+
+
+# ==================== Scheduler ====================
 
 class Scheduler:
-    """
-    Scheduler - 带背压和准入控制的调度器
-    ====================
-    v7.4 核心升级：
-
-    1. Admission Control（准入控制）
-       - 系统过载时延迟低优先级任务
-       - 队列超过高水位时拒绝新任务
-
-    2. Backpressure（背压）
-       - Worker 满载时停止派发
-       - 防止延迟爆炸
-    """
-
     class Strategy(Enum):
         PRIORITY = "priority"
         SJF = "sjf"
@@ -624,7 +856,7 @@ class Scheduler:
         self.cost_tracker = cost_tracker or AdaptiveCostTracker()
 
         self._ready_queue: List[Task] = []
-        self._delayed_queue: List[Task] = []  # v7.4：延迟队列
+        self._delayed_queue: List[Task] = []
         self._running: Dict[str, Task] = {}
         self._completed: Dict[str, Task] = {}
         self._failed: Dict[str, Task] = {}
@@ -633,7 +865,6 @@ class Scheduler:
         self.strategy = self.Strategy.HYBRID
         self._scheduling_log: List[SchedulingDecision] = []
 
-        # v7.4 背压配置
         self.load_threshold = DEFAULT_LOAD_THRESHOLD
         self.queue_high_water = DEFAULT_QUEUE_HIGH_WATER
 
@@ -641,44 +872,21 @@ class Scheduler:
         self.strategy = strategy
 
     def set_load_threshold(self, threshold: float):
-        """设置负载阈值"""
         self.load_threshold = max(0.0, min(1.0, threshold))
 
     def set_high_water(self, water: int):
-        """设置队列高水位"""
         self.queue_high_water = water
 
     def can_dispatch(self, worker_load: float = 0.0) -> bool:
-        """
-        准入控制：检查是否可以派发任务
-        v7.4 核心：防止系统过载
-        """
         with self._lock:
-            # 检查 1：运行中任务是否已满
             if worker_load >= self.load_threshold:
-                self._log_decision(
-                    task_id="",
-                    decision="backpressure",
-                    reason=f"worker_load={worker_load:.2f} >= threshold={self.load_threshold}",
-                    admitted=False
-                )
                 return False
-
-            # 检查 2：队列是否过长
             total_pending = len(self._ready_queue) + len(self._delayed_queue)
             if total_pending >= self.queue_high_water:
-                self._log_decision(
-                    task_id="",
-                    decision="admission_rejected",
-                    reason=f"queue_size={total_pending} >= high_water={self.queue_high_water}",
-                    admitted=False
-                )
                 return False
-
             return True
 
     def get_load_info(self) -> Dict:
-        """获取负载信息"""
         with self._lock:
             return {
                 "running": len(self._running),
@@ -692,8 +900,6 @@ class Scheduler:
     def submit(self, task: Task) -> bool:
         with self._lock:
             task.created_at = self.dag.clock.value if hasattr(self.dag, 'clock') else 0
-
-            # v7.4：设置自适应成本
             task.estimated_cost = self.cost_tracker.get_estimated_cost(task.agent_type)
 
             is_ready = self.dag.add_task(task)
@@ -717,15 +923,9 @@ class Scheduler:
                 return False
 
     def dispatch(self, worker_load: float = 0.0) -> Optional[Task]:
-        """
-        分发任务（带准入控制）
-        v7.4 核心：如果背压触发，不分发
-        """
         with self._lock:
-            # 准入检查
             if worker_load >= self.load_threshold:
                 return None
-
             if not self._ready_queue:
                 return None
 
@@ -754,9 +954,7 @@ class Scheduler:
             self._ready_queue.sort(key=lambda t: (-t.depth, -t.priority.value))
         elif self.strategy == self.Strategy.HYBRID:
             self._ready_queue.sort(key=lambda t: (
-                -t.depth,
-                -t.priority.value,
-                t.estimated_cost
+                -t.depth, -t.priority.value, t.estimated_cost
             ))
 
     def _log_decision(
@@ -781,7 +979,6 @@ class Scheduler:
         ))
 
     def complete(self, task_id: str, result: Dict, score: float, actual_cost: float = 0.0) -> List[Task]:
-        """完成并更新成本模型"""
         with self._lock:
             if task_id in self._running:
                 task = self._running[task_id]
@@ -790,7 +987,6 @@ class Scheduler:
                 task.result = result
                 task.score = score
 
-                # v7.4：记录实际成本
                 if actual_cost > 0 and task.execution_start:
                     task.actual_cost = actual_cost
                     self.cost_tracker.record_actual_cost(
@@ -808,35 +1004,28 @@ class Scheduler:
             self._log_decision(
                 task_id=task_id,
                 decision="completed",
-                reason=f"score={score}, actual_cost={actual_cost:.3f}s, unlocked={len(ready_tasks)}",
+                reason=f"score={score}, actual_cost={actual_cost:.3f}s",
                 priority=task.priority.value if task_id in self._completed else 0,
                 depth=0
             )
 
-            # v7.4：尝试恢复延迟的任务
             self._try_restore_delayed()
 
             return ready_tasks
 
     def _try_restore_delayed(self):
-        """恢复延迟队列中的任务"""
         if not self._delayed_queue:
             return
-
         restored = []
         still_delayed = []
-
         for task in self._delayed_queue:
-            # 检查依赖是否都满足了
             if self.dag.is_ready(task.id):
                 task.status = TaskStatus.READY
                 self._ready_queue.append(task)
                 restored.append(task.id)
             else:
                 still_delayed.append(task)
-
         self._delayed_queue = still_delayed
-
         if restored:
             self._sort_queue()
 
@@ -883,17 +1072,9 @@ class Scheduler:
         return self._scheduling_log
 
 
-# ==================== ReusableWorker（带 Resource Model） ====================
+# ==================== ReusableWorker ====================
 
 class ReusableWorker:
-    """
-    ReusableWorker - 可复用 Worker（v7.4）
-    ====================
-    v7.4 增强：
-    - Resource Model：真实的资源占用追踪
-    - Load 计算：基于实际 CPU/Time 的负载
-    """
-
     def __init__(
         self,
         worker_id: str,
@@ -908,20 +1089,15 @@ class ReusableWorker:
         self.tool_runtime = tool_runtime
         self.llm_cache = llm_cache
 
-        # 统计
         self._tasks_completed = 0
         self._tasks_failed = 0
         self._total_execution_time = 0.0
         self._last_used: Optional[float] = None
 
-        # v7.4 Resource Model
-        self._current_load: float = 0.0  # 0.0-1.0
-        self._capacity: float = 1.0  # 最大容量
-
-        # Memory
+        self._current_load: float = 0.0
+        self._capacity: float = 1.0
         self._memory: Dict[str, Any] = {}
 
-        # Context
         self._context = ExecutionContext(
             agent_id=worker_id,
             allowed_tools=["llm", "verify"],
@@ -930,16 +1106,14 @@ class ReusableWorker:
 
     @property
     def is_available(self) -> bool:
-        """Worker 是否可用（未过载）"""
         return (
             not self._context.is_killed and
             not self._context.should_stop() and
-            self._current_load < self._capacity * 0.95  # 95% 容量为满
+            self._current_load < self._capacity * 0.95
         )
 
     @property
     def load(self) -> float:
-        """当前负载（v7.4 核心）"""
         return self._current_load
 
     @property
@@ -960,12 +1134,9 @@ class ReusableWorker:
         }
 
     def execute(self, task: Task) -> Dict:
-        """执行任务"""
         task.execution_start = time.time()
         self._context.start()
-
-        # v7.4：更新负载
-        self._current_load = min(1.0, self._current_load + 0.3)  # 开始执行增加负载
+        self._current_load = min(1.0, self._current_load + 0.3)
 
         self.state_store.log_trace(
             RuntimeEvent.TASK_STARTED, task.id, self.worker_id,
@@ -990,17 +1161,11 @@ class ReusableWorker:
             if self._context.should_stop():
                 return self._make_error_result("timeout")
 
-            # 计算实际成本
             actual_cost = time.time() - task.execution_start
-
-            # 更新统计
             self._tasks_completed += 1
             self._total_execution_time += actual_cost
             self._last_used = time.time()
-
-            # v7.4：更新负载（执行完成减少）
             self._current_load = max(0.0, self._current_load - 0.3)
-
             result["actual_cost"] = actual_cost
 
             self.state_store.commit_snapshot(
@@ -1027,10 +1192,8 @@ class ReusableWorker:
             }
 
         except Exception as e:
-            # v7.4：更新负载（失败也要减）
             self._current_load = max(0.0, self._current_load - 0.3)
             self._tasks_failed += 1
-
             self.state_store.log_trace(
                 RuntimeEvent.TASK_FAILED, task.id, self.worker_id,
                 {"error": str(e), "traceback": traceback.format_exc()}
@@ -1040,7 +1203,6 @@ class ReusableWorker:
     def _make_error_result(self, error: str) -> Dict:
         return {"status": "error", "error": error, "score": 0, "actual_cost": 0.0}
 
-    # --- Agent 实现 ---
     def _write_lyrics(self, input_data: Dict) -> Dict:
         emotion = input_data.get("emotion", "")
         emotion_detail = input_data.get("emotion_detail", "")
@@ -1130,17 +1292,9 @@ class ReusableWorker:
         return output
 
 
-# ==================== WorkerPool（Resource-Aware） ====================
+# ==================== WorkerPool ====================
 
 class WorkerPool:
-    """
-    WorkerPool - 资源感知 Worker 池（v7.4）
-    ====================
-    v7.4 增强：
-    - Resource Model：真实的 Worker 负载追踪
-    - 负载均衡：基于实际负载选择 Worker
-    """
-
     def __init__(
         self,
         state_store: StateStore,
@@ -1170,12 +1324,10 @@ class WorkerPool:
         with self._lock:
             worker_type = self._get_worker_type(task)
 
-            # 找匹配的可用 worker
             for worker in self._workers.values():
                 if worker.worker_type == worker_type and worker.is_available:
                     return worker
 
-            # 创建新的
             if len(self._workers) < self.size:
                 worker_id = f"worker_{worker_type.value}_{len(self._workers)}"
                 worker = ReusableWorker(
@@ -1188,7 +1340,6 @@ class WorkerPool:
                 self._workers[worker_id] = worker
                 return worker
 
-            # 返回负载最低的
             return self._select_least_loaded_worker(task)
 
     def _get_worker_type(self, task: Task) -> WorkerType:
@@ -1200,7 +1351,6 @@ class WorkerPool:
             return WorkerType.GENERAL
 
     def _select_least_loaded_worker(self, task: Task) -> Optional[ReusableWorker]:
-        """选择负载最低的 Worker（v7.4 基于真实负载）"""
         if not self._workers:
             return None
 
@@ -1223,11 +1373,10 @@ class WorkerPool:
             if not worker:
                 return False
 
-            worker_id = worker.worker_id
-
-            # 检查 worker 是否过载（背压）
             if worker.load >= 0.95:
                 return False
+
+            worker_id = worker.worker_id
 
             future = self._executor.submit(worker.execute, task)
             self._futures[task.id] = future
@@ -1235,11 +1384,7 @@ class WorkerPool:
 
             self.state_store.log_trace(
                 RuntimeEvent.WORKER_SUBMITTED, task.id, worker_id,
-                {
-                    "pool_size": len(self._futures),
-                    "worker_type": worker.worker_type.value,
-                    "worker_load": worker.load
-                }
+                {"pool_size": len(self._futures), "worker_type": worker.worker_type.value, "worker_load": worker.load}
             )
 
             return True
@@ -1275,10 +1420,7 @@ class WorkerPool:
                         pass
                     except Exception as e:
                         self._failed_count += 1
-                        completed.append({
-                            "task_id": task_id, "status": "error",
-                            "error": str(e), "score": 0
-                        })
+                        completed.append({"task_id": task_id, "status": "error", "error": str(e), "score": 0})
 
             for task_id in to_remove:
                 del self._futures[task_id]
@@ -1315,7 +1457,6 @@ class WorkerPool:
         return len(self._futures)
 
     def get_system_load(self) -> float:
-        """获取系统整体负载（v7.4）"""
         if not self._workers:
             return 0.0
         total_load = sum(w.load for w in self._workers.values())
@@ -1352,15 +1493,10 @@ class ToolRuntime:
         start = time.time()
         try:
             result = llm(prompt, temp)
-            self.execution_log.append({
-                "tool": "llm", "elapsed": time.time() - start, "success": True
-            })
+            self.execution_log.append({"tool": "llm", "elapsed": time.time() - start, "success": True})
             return {"output": result}
         except Exception as e:
-            self.execution_log.append({
-                "tool": "llm", "elapsed": time.time() - start,
-                "success": False, "error": str(e)
-            })
+            self.execution_log.append({"tool": "llm", "elapsed": time.time() - start, "success": False, "error": str(e)})
             return {"error": str(e)}
 
     def verify(self, lyrics: str, emotion: str, style: str) -> Dict:
@@ -1387,19 +1523,16 @@ class ToolRuntime:
 
 class ExecutionEngine:
     """
-    Execution Engine - v7.4 稳定执行引擎
+    Execution Engine - v7.5
     ====================
-    核心升级：
-    - Backpressure 感知调度
-    - 自适应成本追踪
-    - 真实资源负载
+    通过 Execution Gate 统一入口
     """
 
     def __init__(self, max_workers: int = MAX_WORKERS, deterministic: bool = False):
         self.clock = LogicalClock()
         self.state_store = StateStore(self.clock)
         self.dag = DAGEngine()
-        self.cost_tracker = AdaptiveCostTracker()  # v7.4
+        self.cost_tracker = AdaptiveCostTracker()
         self.scheduler = Scheduler(self.dag, self.cost_tracker)
         self.llm_cache = LLMCache(enabled=deterministic)
         self.tool_runtime = ToolRuntime(self.state_store)
@@ -1408,13 +1541,50 @@ class ExecutionEngine:
             self.llm_cache, max_workers
         )
 
+        # v7.5 核心：Execution Gate
+        self.gate = ExecutionGate(
+            scheduler=self.scheduler,
+            worker_pool=self.worker_pool,
+            cost_tracker=self.cost_tracker,
+            state_store=self.state_store
+        )
+
         self.max_iterations = 3
         self.convergence_threshold = 7.5
         self._running = False
 
     def run(self, initial_task: Task) -> Dict:
-        """执行任务（带背压感知）"""
+        """执行任务（通过 Gate）"""
         self._running = True
+
+        # v7.5：通过 Gate 评估任务
+        gate_result = self.gate.evaluate(initial_task)
+
+        if gate_result.decision == GateDecision.REJECT:
+            # 任务被拒绝
+            self.state_store.log_trace(
+                RuntimeEvent.TASK_REJECTED,
+                initial_task.id,
+                "execution_gate",
+                {"reason": gate_result.reason, "health": gate_result.health_score}
+            )
+            return {
+                "best_result": None,
+                "best_score": -1,
+                "iterations": 0,
+                "converged": False,
+                "gate_decision": gate_result.decision.value,
+                "gate_reason": gate_result.reason,
+                "system_health": gate_result.health_score
+            }
+
+        elif gate_result.decision == GateDecision.DELAY:
+            # 延迟执行
+            initial_task.status = TaskStatus.DELAYED
+            # 这里简化处理，实际应该放入延迟队列
+            pass
+
+        # 正常提交流程
         self.scheduler.submit(initial_task)
 
         best_result = None
@@ -1424,10 +1594,7 @@ class ExecutionEngine:
         while self._running and iteration < self.max_iterations:
             iteration += 1
 
-            # 获取系统负载
             system_load = self.worker_pool.get_system_load()
-
-            # 调度（带背压）
             task = self.scheduler.dispatch(worker_load=system_load)
 
             if task:
@@ -1436,15 +1603,12 @@ class ExecutionEngine:
                 if self.scheduler.is_idle() and self.worker_pool.active_count == 0:
                     break
 
-            # 收集结果
             for result in self.worker_pool.get_completed():
                 task_id = result.pop('task_id', None) or result.get('task_id')
                 actual_cost = result.get('actual_cost', 0.0)
 
                 if result.get("status") == "success":
                     score = result.get("score", 0)
-
-                    # v7.4：传递实际成本
                     self.scheduler.complete(task_id, result, score, actual_cost)
 
                     if score > best_score:
@@ -1468,7 +1632,8 @@ class ExecutionEngine:
             "best_result": best_result,
             "best_score": best_score,
             "iterations": iteration,
-            "converged": best_score >= self.convergence_threshold
+            "converged": best_score >= self.convergence_threshold,
+            "system_health": self.gate.get_system_health()
         }
 
     def run_feedback_loop(self, writer_task: Task, max_cycles: int = 3) -> Dict:
@@ -1539,7 +1704,8 @@ class ExecutionEngine:
             "state_store": self.state_store.get_summary(),
             "dag": self.dag.get_summary(),
             "cost_tracker": self.cost_tracker.get_learning_stats(),
-            "llm_cache": self.llm_cache.size if self.llm_cache else 0
+            "llm_cache": self.llm_cache.size if self.llm_cache else 0,
+            "execution_gate": self.gate.get_health_breakdown()
         }
 
     def get_scheduling_log(self) -> List[SchedulingDecision]:
@@ -1554,7 +1720,7 @@ class ExecutionEngine:
 
 class AgentOSKernel:
     """
-    Agent OS Kernel - v7.4
+    Agent OS Kernel - v7.5
     """
 
     def __init__(self, max_workers: int = MAX_WORKERS, deterministic: bool = False):
@@ -1577,6 +1743,14 @@ class AgentOSKernel:
 
     def get_scheduling_decisions(self) -> List[SchedulingDecision]:
         return self.engine.get_scheduling_log()
+
+    def get_system_health(self) -> float:
+        """获取系统健康度"""
+        return self.engine.gate.get_system_health()
+
+    def get_health_breakdown(self) -> Dict:
+        """获取健康度明细"""
+        return self.engine.gate.get_health_breakdown()
 
     def shutdown(self):
         self.engine.shutdown()
