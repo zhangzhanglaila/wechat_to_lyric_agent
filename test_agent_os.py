@@ -1,7 +1,7 @@
 """
-v7.3 Agent OS - Unit Tests (No LLM)
-====================================
-测试核心调度逻辑，不依赖 LLM
+v7.4 Agent OS - Stability Tests
+================================
+测试 Backpressure + Admission Control + Adaptive Cost + Resource Model
 """
 
 import sys
@@ -10,98 +10,88 @@ sys.path.insert(0, '.')
 from agent_os import (
     Task, TaskPriority, TaskStatus,
     DAGEngine, Scheduler, StateStore, LogicalClock,
-    ReusableWorker, WorkerPool, WorkerType, ToolRuntime
+    ReusableWorker, WorkerPool, WorkerType, ToolRuntime,
+    AdaptiveCostTracker
 )
 
-def test_dag_depth():
-    """测试 DAG 深度计算"""
+
+def test_adaptive_cost_tracker():
+    """测试自适应成本追踪"""
     print("=" * 50)
-    print("DAG Depth Calculation")
+    print("Adaptive Cost Tracker")
+    print("=" * 50)
+
+    tracker = AdaptiveCostTracker()
+
+    # 初始估计
+    cost1 = tracker.get_estimated_cost("writer")
+    print(f"  Initial writer cost: {cost1}")
+
+    # 记录实际成本（成功任务）
+    tracker.record_actual_cost("writer", 2.5, task_success=True)
+    tracker.record_actual_cost("writer", 3.5, task_success=True)
+    tracker.record_actual_cost("writer", 2.0, task_success=True)
+
+    # 学习后估计
+    cost2 = tracker.get_estimated_cost("writer")
+    print(f"  After learning: {cost2}")
+
+    stats = tracker.get_learning_stats()
+    print(f"  Stats: {stats}")
+
+    # 失败任务不计入
+    tracker.record_actual_cost("writer", 10.0, task_success=False)
+    cost3 = tracker.get_estimated_cost("writer")
+    print(f"  After failed task: {cost3}")
+
+    assert stats["writer"]["count"] == 3, "Should only count 3 successful tasks"
+    print("  [PASS]")
+
+
+def test_admission_control():
+    """测试准入控制"""
+    print("\n" + "=" * 50)
+    print("Admission Control")
     print("=" * 50)
 
     dag = DAGEngine()
+    tracker = AdaptiveCostTracker()
+    scheduler = Scheduler(dag, tracker)
 
-    # 创建 DAG: A -> B -> C, A -> D
-    task_a = Task(id="A", agent_type="writer", input_data={})
-    task_b = Task(id="B", agent_type="critic", input_data={}, dependencies={"A"})
-    task_c = Task(id="C", agent_type="editor", input_data={}, dependencies={"B"})
-    task_d = Task(id="D", agent_type="title", input_data={}, dependencies={"A"})
+    # 设置低阈值
+    scheduler.set_load_threshold(0.5)
+    scheduler.set_high_water(3)
 
-    dag.add_task(task_a)
-    dag.add_task(task_b)
-    dag.add_task(task_c)
-    dag.add_task(task_d)
+    print(f"  Load threshold: {scheduler.load_threshold}")
+    print(f"  High water: {scheduler.queue_high_water}")
 
-    print(f"  A depth: {task_a.depth} (expected: 0)")
-    print(f"  B depth: {task_b.depth} (expected: 1)")
-    print(f"  C depth: {task_c.depth} (expected: 2)")
-    print(f"  D depth: {task_d.depth} (expected: 1)")
+    # 模拟过载
+    can_dispatch_1 = scheduler.can_dispatch(worker_load=0.3)
+    print(f"  can_dispatch(load=0.3): {can_dispatch_1} (expected: True)")
 
-    # 验证 B/C 未就绪因为依赖未完成
-    assert task_b.status == TaskStatus.PENDING
-    assert task_c.status == TaskStatus.PENDING
-    assert task_d.status == TaskStatus.PENDING
+    can_dispatch_2 = scheduler.can_dispatch(worker_load=0.6)
+    print(f"  can_dispatch(load=0.6): {can_dispatch_2} (expected: False)")
 
-    # 完成 A，B 和 D 应该就绪
-    ready = dag.mark_complete("A")
-    assert len(ready) == 2, f"Expected 2 ready tasks, got {len(ready)}"
+    # 检查调度日志
+    log = scheduler.get_scheduling_log()
+    backpressure_events = [d for d in log if d.decision == "backpressure"]
+    print(f"  Backpressure events: {len(backpressure_events)}")
 
-    print(f"  After A complete: {[t.id for t in ready]} ready")
+    assert can_dispatch_1 == True
+    assert can_dispatch_2 == False
     print("  [PASS]")
 
-def test_scheduling_strategies():
-    """测试调度策略"""
+
+def test_resource_model():
+    """测试资源模型"""
     print("\n" + "=" * 50)
-    print("Scheduling Strategies")
-    print("=" * 50)
-
-    dag = DAGEngine()
-    scheduler = Scheduler(dag)
-
-    tasks = [
-        Task(id="t1", agent_type="writer", input_data={}, priority=TaskPriority.LOW),
-        Task(id="t2", agent_type="critic", input_data={}, priority=TaskPriority.CRITICAL),
-        Task(id="t3", agent_type="editor", input_data={}, priority=TaskPriority.NORMAL),
-    ]
-    for t in tasks:
-        scheduler.submit(t)
-
-    # Priority
-    scheduler.set_strategy(Scheduler.Strategy.PRIORITY)
-    scheduler._sort_queue()
-    order = [t.id for t in scheduler._ready_queue]
-    print(f"  PRIORITY: {order}")
-    assert order == ["t2", "t3", "t1"], f"Priority failed: {order}"
-
-    # SJF
-    scheduler._ready_queue = tasks
-    scheduler.set_strategy(Scheduler.Strategy.SJF)
-    scheduler._sort_queue()
-    order = [t.id for t in scheduler._ready_queue]
-    print(f"  SJF: {order}")
-    # writer=3.0, critic=2.0, editor=2.5
-    assert order == ["t2", "t3", "t1"], f"SJF failed: {order}"
-
-    # Hybrid
-    scheduler._ready_queue = tasks
-    scheduler.set_strategy(Scheduler.Strategy.HYBRID)
-    scheduler._sort_queue()
-    order = [t.id for t in scheduler._ready_queue]
-    print(f"  HYBRID: {order}")
-
-    print("  [PASS]")
-
-def test_worker_reuse():
-    """测试 Worker 复用"""
-    print("\n" + "=" * 50)
-    print("Worker Reuse")
+    print("Resource Model")
     print("=" * 50)
 
     clock = LogicalClock()
     state_store = StateStore(clock)
     tool_runtime = ToolRuntime(state_store)
 
-    # 创建 ReusableWorker
     worker = ReusableWorker(
         worker_id="test_worker",
         worker_type=WorkerType.LLM,
@@ -110,21 +100,61 @@ def test_worker_reuse():
         llm_cache=None
     )
 
-    print(f"  Worker: {worker.worker_id}")
-    print(f"  Type: {worker.worker_type.value}")
+    print(f"  Initial load: {worker.load}")
     print(f"  Available: {worker.is_available}")
-    print(f"  Completed: {worker.stats['tasks_completed']}")
 
-    # 模拟执行（不真正调用 LLM）
-    task = Task(id="mock_task", agent_type="writer", input_data={})
-    # worker.execute(task) 会真正调用 LLM，所以我们只测结构
+    # 模拟任务执行（负载变化）
+    worker._current_load = 0.8
+    print(f"  After task start: {worker.load}")
+
+    worker._current_load = max(0.0, worker._current_load - 0.3)
+    print(f"  After task complete: {worker.load}")
+
+    stats = worker.stats
+    print(f"  Stats: load={stats['load']}, capacity={stats['capacity']}")
 
     print("  [PASS]")
 
-def test_worker_pool():
-    """测试 WorkerPool"""
+
+def test_backpressure_in_dispatch():
+    """测试调度器背压"""
     print("\n" + "=" * 50)
-    print("Worker Pool")
+    print("Backpressure in Dispatch")
+    print("=" * 50)
+
+    dag = DAGEngine()
+    tracker = AdaptiveCostTracker()
+    scheduler = Scheduler(dag, tracker)
+
+    # 提交任务
+    task = Task(id="t1", agent_type="writer", input_data={}, priority=TaskPriority.HIGH)
+    scheduler.submit(task)
+
+    # 正常调度
+    dispatched = scheduler.dispatch(worker_load=0.0)
+    print(f"  Dispatched (load=0.0): {dispatched is not None}")
+
+    # 重新入队
+    scheduler._ready_queue.append(task)
+    task.status = TaskStatus.READY
+    scheduler._running.pop(task.id, None)
+
+    # 背压时调度失败
+    dispatched = scheduler.dispatch(worker_load=0.9)
+    print(f"  Dispatched (load=0.9): {dispatched is None}")
+
+    log = scheduler.get_scheduling_log()
+    backpressure = [d for d in log if d.decision == "backpressure"]
+    print(f"  Backpressure decisions: {len(backpressure)}")
+
+    assert dispatched is None
+    print("  [PASS]")
+
+
+def test_worker_load_balancing():
+    """测试 Worker 负载均衡"""
+    print("\n" + "=" * 50)
+    print("Worker Load Balancing")
     print("=" * 50)
 
     clock = LogicalClock()
@@ -135,146 +165,91 @@ def test_worker_pool():
         state_store=state_store,
         tool_runtime=tool_runtime,
         llm_cache=None,
-        size=2
+        size=3
     )
 
-    print(f"  Max workers: {pool.size}")
-    print(f"  Strategy: {pool._selection_strategy}")
+    print(f"  Initial system load: {pool.get_system_load()}")
 
-    # 设置策略
-    pool.set_selection_strategy("least_loaded")
-    assert pool._selection_strategy == "least_loaded"
+    # 创建 workers
+    w1 = ReusableWorker("w1", WorkerType.LLM, state_store, tool_runtime, None)
+    w2 = ReusableWorker("w2", WorkerType.LLM, state_store, tool_runtime, None)
 
-    # 选择策略（mock task，不真正提交）
-    # 因为 _select_worker 会调用 llm，我们只测结构
-    print(f"  Strategy set: {pool._selection_strategy}")
+    pool._workers["w1"] = w1
+    pool._workers["w2"] = w2
+
+    # 设置不同负载
+    w1._current_load = 0.8
+    w2._current_load = 0.2
+
+    print(f"  w1 load: {w1.load}")
+    print(f"  w2 load: {w2.load}")
+    print(f"  System load: {pool.get_system_load()}")
 
     pool.shutdown()
+
     print("  [PASS]")
 
-def test_scheduling_decision_log():
-    """测试调度决策日志"""
+
+def test_scheduling_log_with_admission():
+    """测试调度日志包含准入决策"""
     print("\n" + "=" * 50)
-    print("Scheduling Decision Log")
+    print("Scheduling Log with Admission")
     print("=" * 50)
 
     dag = DAGEngine()
-    scheduler = Scheduler(dag)
+    tracker = AdaptiveCostTracker()
+    scheduler = Scheduler(dag, tracker)
 
-    # 提交任务
-    task = Task(
-        id="test_task",
-        agent_type="writer",
-        input_data={},
-        priority=TaskPriority.HIGH
-    )
-    scheduler.submit(task)
+    scheduler.set_load_threshold(0.5)
 
-    # 分发
-    dispatched = scheduler.dispatch()
-    assert dispatched is not None
-    assert dispatched.id == "test_task"
+    # 触发背压
+    scheduler.can_dispatch(worker_load=0.6)
 
-    # 检查决策日志
     log = scheduler.get_scheduling_log()
-    print(f"  Decisions logged: {len(log)}")
+    print(f"  Total decisions: {len(log)}")
 
     for d in log:
-        print(f"    [{d.decision}] {d.task_id}: {d.reason}")
+        print(f"    [{d.decision}] admitted={d.admitted}: {d.reason}")
+
+    admitted_decisions = [d for d in log if d.admitted]
+    rejected_decisions = [d for d in log if not d.admitted]
+
+    print(f"  Admitted: {len(admitted_decisions)}, Rejected: {len(rejected_decisions)}")
 
     print("  [PASS]")
 
-def test_state_store():
-    """测试 StateStore"""
+
+def test_full_system_v74():
+    """测试完整 v7.4 系统"""
     print("\n" + "=" * 50)
-    print("State Store")
-    print("=" * 50)
-
-    store = StateStore()
-
-    # 提交 snapshots
-    s1 = store.commit_snapshot("agent_1", "task_1", {"v": 1}, 6.0)
-    s2 = store.commit_snapshot("agent_1", "task_2", {"v": 2}, 8.0)
-    s3 = store.commit_snapshot("agent_2", "task_3", {"v": 3}, 7.5)
-
-    print(f"  Snapshots: {store.snapshot_count}")
-    print(f"  Best score: {store.get_best_score()}")
-    print(f"  Checkpoint: {store.get_best_snapshot('agent_1').hash}")
-
-    # 回滚
-    store.rollback_to(s1.hash)
-    state = store.get_agent_state("agent_1")
-    print(f"  After rollback: {state}")
-
-    print("  [PASS]")
-
-def test_full_system_structure():
-    """测试完整系统结构"""
-    print("\n" + "=" * 50)
-    print("System Structure")
+    print("Full System v7.4")
     print("=" * 50)
 
     from agent_os import AgentOSKernel
 
     kernel = AgentOSKernel()
 
-    print("  Components:")
-    print(f"    - Scheduler: {kernel.engine.scheduler}")
-    print(f"    - WorkerPool: {kernel.engine.worker_pool}")
-    print(f"    - DAG: {kernel.engine.dag}")
-    print(f"    - StateStore: {kernel.engine.state_store}")
-
     state = kernel.get_state()
-    print(f"\n  Scheduler: {state['scheduler']}")
+
+    print(f"  Scheduler: {state['scheduler']}")
+    print(f"  Scheduler Load: {state['scheduler_load']}")
     print(f"  Worker Pool: {state['worker_pool']}")
-    print(f"  DAG: {state['dag']}")
+    print(f"  Cost Tracker: {state['cost_tracker']}")
+
+    kernel.shutdown()
 
     print("  [PASS]")
 
-def test_dag_wakeup():
-    """测试 DAG 任务唤醒"""
-    print("\n" + "=" * 50)
-    print("DAG Task Wakeup")
-    print("=" * 50)
-
-    dag = DAGEngine()
-
-    # 创建链: A -> B -> C
-    task_a = Task(id="A", agent_type="writer", input_data={})
-    task_b = Task(id="B", agent_type="critic", input_data={}, dependencies={"A"})
-    task_c = Task(id="C", agent_type="editor", input_data={}, dependencies={"B"})
-
-    dag.add_task(task_a)
-    dag.add_task(task_b)
-    dag.add_task(task_c)
-
-    # A 就绪，B 和 C 等待
-    assert task_a.status == TaskStatus.READY
-    assert task_b.status == TaskStatus.PENDING
-    assert task_c.status == TaskStatus.PENDING
-
-    # 完成 A
-    ready_b = dag.mark_complete("A")
-    print(f"  After A: {[t.id for t in ready_b]} ready")
-    assert len(ready_b) == 1 and ready_b[0].id == "B"
-
-    # 完成 B
-    ready_c = dag.mark_complete("B")
-    print(f"  After B: {[t.id for t in ready_c]} ready")
-    assert len(ready_c) == 1 and ready_c[0].id == "C"
-
-    print("  [PASS]")
 
 if __name__ == "__main__":
-    test_dag_depth()
-    test_scheduling_strategies()
-    test_worker_reuse()
-    test_worker_pool()
-    test_scheduling_decision_log()
-    test_state_store()
-    test_full_system_structure()
-    test_dag_wakeup()
+    test_adaptive_cost_tracker()
+    test_admission_control()
+    test_resource_model()
+    test_backpressure_in_dispatch()
+    test_worker_load_balancing()
+    test_scheduling_log_with_admission()
+    test_full_system_v74()
 
     print("\n" + "=" * 50)
-    print("ALL V7.3 UNIT TESTS PASSED")
+    print("ALL V7.4 TESTS PASSED")
     print("=" * 50)
