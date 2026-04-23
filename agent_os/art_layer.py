@@ -438,7 +438,12 @@ class LyricPlanner:
 
         return plan
 
-    def generate_prompt_parts(self, compression_result: Dict, lyric_plan: Dict) -> Dict:
+    def generate_prompt_parts(
+        self,
+        compression_result: Dict,
+        lyric_plan: Dict,
+        narrative: Dict = None
+    ) -> Dict:
         emotion_vector = compression_result["emotion_vector"]
         imagery = compression_result["imagery_tokens"]
         theme = compression_result["core_theme"]
@@ -452,7 +457,34 @@ class LyricPlanner:
             "hook": self._format_hook(lyric_plan)
         }
 
+        # v9.2: 加入叙事骨架，引导LLM按叙事弧生成
+        if narrative:
+            narrative_context = self._format_narrative(narrative)
+            parts["narrative"] = narrative_context
+
         return parts
+
+    def _format_narrative(self, narrative: Dict) -> str:
+        """v9.3: 格式化叙事骨架到提示词"""
+        lines = ["\n叙事骨架（按此弧线展开歌词）："]
+        arc_type = narrative.get("arc_type", "heartbreak")
+        lines.append(f"叙事弧线：{arc_type}")
+
+        events = narrative.get("events", [])
+        if events:
+            lines.append("叙事事件（每个事件扩2-3句）：")
+            for event_type, event_desc in events:
+                lines.append(f"- {event_desc}")
+
+        lines.append(f"叙事视角：第一人称（我对你说）")
+        lines.append("歌词要求（严格遵守）：")
+        lines.append("- 每个事件必须扩展成2-3句，不能只有一句")
+        lines.append("- 句子之间要有画面感和情绪递进")
+        lines.append("- 中间必须有转折句（如：后来我才明白/那一刻我才懂）")
+        lines.append("- 不要抽象概括，要具体场景描写")
+        lines.append("- 像歌词，不是改写聊天记录")
+
+        return "\n".join(lines)
 
     def _format_structure(self, plan: Dict) -> str:
         lines = ["歌词结构："]
@@ -1081,6 +1113,14 @@ class HumanRewriteLayer:
         profile_strength = intensity * emotion_weight
 
         lines = lyrics.split("\n")
+
+        # v9.1: 创建语篇上下文（整个段落共享状态）
+        discourse_ctx = self.RewriteContext(
+            profile=active_profile,
+            profile_strength=profile_strength,
+            total_lines=len(lines)
+        )
+
         humanized_lines = []
 
         for i, line in enumerate(lines):
@@ -1104,9 +1144,10 @@ class HumanRewriteLayer:
                 emotion_weight, emotion_curve_position, i, len(lines)
             )
 
-            # ✅ v9.0 语义驱动 Rewrite（替代概率驱动的 _apply_profile_driven_noise）
+            # ✅ v9.1 语义驱动 Rewrite（context 驱动，替代 v9.0 的纯参数）
             line = self.rewrite_line(
-                line, line_emotion_weight, active_profile, profile_strength
+                line, line_emotion_weight, active_profile, profile_strength,
+                context=discourse_ctx
             )
 
             humanized_lines.append(line)
@@ -1435,12 +1476,133 @@ class HumanRewriteLayer:
         "就是突然觉得……好像不太对了",
     ]
 
+    # ==================== v9.1 Discourse State ====================
+
+    class RewriteContext:
+        """
+        v9.1 语篇状态：追踪全局一致性
+
+        解决的问题：
+        - 每行独立 rewrite → 全局叙事一致性
+        - 情绪随机 → 情绪轨迹连续性
+        - 自我否定随机触发 → 有节制的叙事节奏
+        """
+
+        def __init__(
+            self,
+            profile: HumanProfile,
+            profile_strength: float,
+            total_lines: int = 1
+        ):
+            self.profile = profile
+            self.profile_strength = profile_strength
+            self.total_lines = total_lines
+
+            # 情绪轨迹
+            self.emotion_trace: List[float] = []
+
+            # 已使用的句尾关键词（用于避免重复）
+            self.used_keywords: List[str] = []
+
+            # 预算系统（核心升级）
+            # 不是"情绪高就触发"，而是"有预算才触发"
+            self.contradiction_budget: float = 1.0   # 自我否定预算
+            self.asymmetry_budget: float = 1.0        # 不对称预算
+            self.repetition_budget: float = 1.0       # 重复卡顿预算
+
+            # 上一次的 rewrite 结果（用于 discourse 引用）
+            self.last_line: str = ""
+            self.last_result: str = ""
+
+            # 段落内的矛盾使用次数（人类写作不会每句都自打脸）
+            self.contradiction_used: int = 0
+            self.max_contradictions_per_section: int = 2
+
+        def consume_contradiction(self) -> bool:
+            """尝试消耗矛盾预算"""
+            if self.contradiction_budget > 0.3 and self.contradiction_used < self.max_contradictions_per_section:
+                self.contradiction_budget -= 0.4
+                self.contradiction_used += 1
+                return True
+            return False
+
+        def consume_asymmetry(self) -> bool:
+            """尝试消耗不对称预算"""
+            if self.asymmetry_budget > 0.3:
+                self.asymmetry_budget -= 0.3
+                return True
+            return False
+
+        def consume_repetition(self) -> bool:
+            """尝试消耗重复预算"""
+            if self.repetition_budget > 0.2:
+                self.repetition_budget -= 0.2
+                return True
+            return False
+
+        def record_keyword(self, keyword: str):
+            """记录已使用的关键词，避免重复"""
+            if keyword not in self.used_keywords:
+                self.used_keywords.append(keyword)
+
+        def update_emotion(self, emotion_weight: float):
+            """更新情绪轨迹"""
+            self.emotion_trace.append(emotion_weight)
+
+        def get_trajectory_slope(self) -> float:
+            """获取情绪轨迹斜率（上升/下降/平稳）"""
+            if len(self.emotion_trace) < 2:
+                return 0.0
+            recent = self.emotion_trace[-3:]
+            if len(recent) < 2:
+                return 0.0
+            return recent[-1] - recent[0]
+
+        def should_use_contradiction(self, emotion_weight: float) -> bool:
+            """
+            决定是否使用矛盾表达
+            条件：情绪够高 + 有预算 + 还没用超
+            """
+            if not self.profile:
+                return emotion_weight > 0.7
+
+            base_prob = emotion_weight * self.profile.correction
+            budget_factor = self.contradiction_budget
+            usage_limit = self.contradiction_used < self.max_contradictions_per_section
+
+            return base_prob * budget_factor > 0.3 and usage_limit
+
+        def should_use_asymmetry(self, emotion_weight: float) -> bool:
+            """决定是否使用不对称（情绪够高 + 有预算）"""
+            if not self.profile:
+                return emotion_weight > 0.5
+
+            base_prob = emotion_weight * self.profile.fragmentation
+            return base_prob * self.asymmetry_budget > 0.2
+
+        def should_use_repetition(self, emotion_weight: float) -> bool:
+            """
+            决定是否使用轻微重复
+            条件：情绪不低 + 犹豫人格 + 有预算 + 情绪轨迹平稳
+            """
+            if not self.profile:
+                return emotion_weight > 0.4
+
+            # 情绪轨迹下降时不鼓励重复（情绪上升时才卡顿）
+            slope = self.get_trajectory_slope()
+            if slope < -0.1:
+                return False
+
+            base_prob = emotion_weight * self.profile.hesitation * self.repetition_budget
+            return base_prob > 0.15
+
     def rewrite_line(
         self,
         line: str,
         emotion_weight: float,
         profile: HumanProfile,
-        profile_strength: float
+        profile_strength: float,
+        context: 'RewriteContext' = None
     ) -> str:
         """
         v9.0 语义驱动的人类化Rewrite管线
@@ -1455,24 +1617,34 @@ class HumanRewriteLayer:
         """
         import random
 
-        # 1. 语义停顿（规则优先）
+        # v9.1: 如果没有 context，创建一个宽松的默认 context
+        if context is None:
+            ctx = self.RewriteContext(profile, profile_strength)
+        else:
+            ctx = context
+
+        # 1. 语义停顿（规则优先，与 context 无关）
         line = self._apply_semantic_pause(line, profile)
 
-        # 2. 自我否定（情绪峰值触发）
-        if emotion_weight > 0.6:
-            line = self._apply_contradiction(line, emotion_weight, profile)
+        # 2. 自我否定（v9.1: 预算驱动，而非情绪阈值）
+        # 不再是 if emotion_weight > 0.6，而是 ctx.should_use_contradiction()
+        line = self._apply_contradiction_v9(line, ctx)
 
-        # 3. 不对称句式（打破AI工整感）
-        if emotion_weight > 0.4:
-            line = self._apply_asymmetry(line, profile)
+        # 3. 不对称句式（v9.1: 预算驱动）
+        if ctx.should_use_asymmetry(emotion_weight):
+            line = self._apply_asymmetry_v9(line, ctx)
 
-        # 4. 轻微卡顿（犹豫/后悔情绪时）
-        if emotion_weight > 0.3 and profile.hesitation > 0.3:
-            line = self._apply_imperfect_repetition(line, profile)
+        # 4. 轻微卡顿（v9.1: 情绪轨迹斜率）
+        if ctx.should_use_repetition(emotion_weight):
+            line = self._apply_imperfect_repetition_v9(line, ctx)
 
         # 5. 兜底：概率驱动的人格噪声（原有逻辑）
         if random.random() < profile_strength * 0.3:
             line = self._apply_probability_filler(line, profile)
+
+        # 更新 context 状态
+        ctx.update_emotion(emotion_weight)
+        ctx.last_line = line
 
         return line
 
@@ -1675,6 +1847,143 @@ class HumanRewriteLayer:
 
         return line
 
+    # ==================== v9.1 Budget-driven rewrite methods ====================
+
+    def _apply_contradiction_v9(self, line: str, ctx: 'RewriteContext') -> str:
+        """
+        v9.1 自我否定（预算驱动版）
+
+        替代原来的 emotion_weight > 0.6 硬判断
+        现在使用 ctx.should_use_contradiction() 做软判断
+        """
+        import random
+        clean = line.strip()
+        if len(clean) < 4:
+            return line
+
+        # 已经处理过的跳过
+        if "……但没有" in clean or "——至少我以为" in clean or "其实" in clean[:4]:
+            return line
+
+        # 语义触发词
+        trigger_words = ["以为", "放下", "忘记", "不在意", "算了", "该忘"]
+        triggered = any(w in clean for w in trigger_words)
+
+        if not triggered:
+            return line
+
+        # v9.1: 预算检查
+        if not ctx.should_use_contradiction(ctx.emotion_trace[-1] if ctx.emotion_trace else 0.5):
+            return line
+
+        if not ctx.consume_contradiction():
+            return line
+
+        # 提取并生成矛盾模板
+        for keyword in trigger_words:
+            if keyword in clean:
+                idx = clean.find(keyword)
+                state = clean[idx:idx+3] if idx + 3 <= len(clean) else clean[idx:]
+                templates = [
+                    f"我以为我已经{state}了……但没有",
+                    f"我说不在意，其实{state}",
+                    f"不是因为工作忙，只是{state}",
+                ]
+                chosen = random.choice(templates)
+                if "{state}" in chosen:
+                    chosen = chosen.replace("{state}", state.rstrip("了"))
+                return chosen
+                break
+
+        return line
+
+    def _apply_asymmetry_v9(self, line: str, ctx: 'RewriteContext') -> str:
+        """
+        v9.1 不对称句式（预算驱动版）
+        """
+        import random
+        clean = line.strip()
+        if len(clean) < 8:
+            return line
+
+        if not ctx.consume_asymmetry():
+            return line
+
+        # 检测对称结构
+        comma_count = clean.count("，")
+
+        if comma_count >= 1:
+            parts = clean.split("，")
+            if len(parts) >= 2:
+                first = parts[0].strip()
+                second = "，".join(parts[1:]).strip()
+
+                # 如果前后都是"你/我"开头，打破它
+                if (first.startswith("你") or first.startswith("我")) and \
+                   (second.startswith("你") or second.startswith("我")):
+                    # 用情绪轨迹斜率决定延迟方式
+                    slope = ctx.get_trajectory_slope()
+                    if slope > 0.1:
+                        # 情绪上升：加"后来才"
+                        delay_words = ["只是", "后来才", "过了很久才"]
+                        delay = random.choice(delay_words)
+                        return f"{first}，{delay}{second[1:]}"
+                    else:
+                        # 情绪平稳/下降：直接断句
+                        if len(first) > 2 and len(second) > 2:
+                            return f"{first}\n{second}"
+
+        # 平行结构破坏
+        if "了" in clean and comma_count >= 1:
+            parts = clean.split("，")
+            if len(parts) >= 2 and "了" in parts[0]:
+                parts[1] = parts[1].replace("了", "……")
+                return "，".join(parts)
+
+        return line
+
+    def _apply_imperfect_repetition_v9(self, line: str, ctx: 'RewriteContext') -> str:
+        """
+        v9.1 轻微重复（预算+轨迹驱动版）
+        """
+        import random
+        clean = line.strip()
+        if len(clean) < 6:
+            return line
+
+        if not ctx.consume_repetition():
+            return line
+
+        # 记录使用的关键词
+        for kw in ctx.profile.echo_keywords:
+            if kw in clean and len(clean) > 5:
+                idx = clean.rfind(kw)
+                if idx > 2:
+                    before = clean[:idx]
+                    after = clean[idx:]
+                    ctx.record_keyword(kw)
+                    return f"{before}……{after}"
+                    break
+
+        # discourse-level 引用：检查上一句是否有可引用的词
+        if ctx.last_result:
+            for kw in ctx.profile.echo_keywords:
+                if kw in ctx.last_result and kw not in ctx.used_keywords:
+                    if kw in clean:
+                        idx = clean.rfind(kw)
+                        before = clean[:idx]
+                        after = clean[idx:]
+                        ctx.record_keyword(kw)
+                        # 在引用点制造"卡住"
+                        templates = [
+                            f"{before}……{after}",
+                            f"{before}，{after}",
+                        ]
+                        return random.choice(templates)
+                    break
+
+        return line
+
     def _apply_probability_filler(self, line: str, profile: HumanProfile) -> str:
         """
         兜底：概率驱动的人格语气词
@@ -1771,6 +2080,439 @@ class HumanRewriteLayer:
     def humanize_mild(self, lyrics: str) -> str:
         """轻度人类化（intensity=0.2）"""
         return self.humanize(lyrics, intensity=0.2)
+
+
+# ==================== Art Layer: Narrative Builder (v9.2) ====================
+
+class NarrativeBuilder:
+    """
+    v9.2 Narrative Builder - 聊天 → 叙事骨架 → 歌词结构
+
+    解决的核心问题：
+    1. 微信是"碎片对话"，歌词需要"完整叙事弧"
+    2. 微信是"你/我/他混着"，歌词需要"统一视角"
+    3. 微信是"句子"，歌词需要"事件骨架"
+
+    架构：
+    WeChat Chat
+        ↓
+    Event Extraction（事件抽取）
+        ↓
+    Perspective Unification（视角统一）
+        ↓
+    Narrative Arc Builder（叙事弧构建）
+        ↓
+    Lyric-ready Event List
+    """
+
+    # 事件模板：从聊天行为映射到歌词事件
+    EVENT_TEMPLATES = {
+        "distance": [
+            "{target}开始变得冷淡",
+            "{target}不再像以前那样",
+            "{target}的回复越来越慢",
+        ],
+        "doubt": [
+            "{self}反复确认关系",
+            "{self}开始患得患失",
+            "{self}想问又不敢问",
+        ],
+        "silence": [
+            "{target}突然不说话了",
+            "{target}开始已读不回",
+            "{target}不回消息的那天",
+        ],
+        "self_doubt": [
+            "{self}开始怀疑自己",
+            "{self}觉得是自己的问题",
+            "{self}反复回想哪里做错了",
+        ],
+        "resignation": [
+            "{self}不再追问了",
+            "{self}假装什么都没发生",
+            "{self}假装一切如常",
+        ],
+        "realization": [
+            "{self}后来才明白",
+            "原来不是{self}的问题",
+            "{self}终于懂了",
+        ],
+        "pain": [
+            "{self}那晚哭了很久",
+            "{self}一个人想了很久",
+            "那种痛说不出来",
+        ],
+    }
+
+    # 叙事弧线结构
+    NARRATIVE_ARCS = {
+        "heartbreak": ["distance", "doubt", "silence", "self_doubt", "resignation", "realization"],
+        "nostalgia": ["distance", "pain", "doubt", "realization"],
+        "regret": ["self_doubt", "pain", "realization"],
+        "longing": ["distance", "doubt", "pain"],
+    }
+
+    # v9.3: 转折句模板（在 verse2 前插入）
+    TURNING_POINT_TEMPLATES = [
+        "后来我才明白",
+        "那一刻我才懂",
+        "原来不是这样",
+        "直到你走了我才",
+    ]
+
+    # v9.3: 事件扩展模板
+    EVENT_EXPANSION_TEMPLATES = {
+        "silence": [
+            "我盯着屏幕等了很久",
+            "消息框亮了又灭",
+            "像你对我那点耐心",
+        ],
+        "distance": [
+            "我以为一切都没变",
+            "直到那天才发现",
+        ],
+        "doubt": [
+            "我反复问自己",
+            "是不是我想太多",
+        ],
+        "self_doubt": [
+            "我开始怀疑自己",
+            "是不是我真的不够好",
+        ],
+        "pain": [
+            "那种感觉说不出来",
+            "只有自己知道有多痛",
+        ],
+        "resignation": [
+            "我告诉自己别想了",
+            "算了，就这样吧",
+        ],
+        "realization": [
+            "原来从头到尾",
+            "只是我一个人在撑",
+        ],
+    }
+
+    def __init__(self):
+        self.last_narrative = None
+        self._chat_context = []  # 保留原始聊天上下文用于rewrite
+
+    # ==================== v9.3 Event Rewrite ====================
+
+    def _rewrite_from_chat(self, event_desc: str, event_type: str) -> str:
+        """
+        v9.3: 从聊天原句中提取信息，重写事件描述
+
+        不用模板句子，而是从实际聊天内容中提炼
+        这样事件描述会更具体、更像用户自己的话
+        """
+        # 用原始聊天上下文匹配最相似的句子，重写为歌词风格
+        if not self._chat_context:
+            return event_desc
+
+        combined = " ".join(self._chat_context)
+
+        # silence 事件：从"不回"相关句子提取关键词
+        if event_type == "silence":
+            if "秒回" in combined:
+                # 用户提到过对比
+                return "你从秒回变成沉默那天"
+            if "突然" in combined:
+                return "你突然就不再说话了"
+            if "等" in combined:
+                return "我等了一夜没有回复"
+            return "你开始不回消息"
+
+        # distance 事件
+        if event_type == "distance":
+            if "以前" in combined or "那时候" in combined:
+                # 找"以前..."的句子
+                return "你以前不是这样的"
+            if "变了" in combined:
+                return "我们好像变了"
+            return "你离我越来越远"
+
+        # doubt 事件
+        if event_type == "doubt":
+            if "是不是" in combined:
+                # 用户的原句"是不是我哪里做错了"
+                return "我反复问自己是不是我的错"
+            if "确认" in combined:
+                return "我在等一个确切的答案"
+            return "我开始怀疑这一切"
+
+        # self_doubt 事件
+        if event_type == "self_doubt":
+            if "我哪里" in combined or "是不是" in combined:
+                return "是不是我哪里做错了"
+            if "凭什么" in combined:
+                return "我凭什么要受这些"
+            return "只有我一个人在撑着"
+
+        # pain 事件
+        if event_type == "pain":
+            if "哭" in combined:
+                return "那晚我哭到喘不上气"
+            if "想" in combined:
+                return "我一个人想到天亮"
+            return "那种痛说不出来"
+
+        # resignation 事件
+        if event_type == "resignation":
+            if "算了" in combined:
+                return "我告诉自己算了"
+            if "假装" in combined:
+                return "我假装什么都没发生"
+            return "我不再问了你"
+
+        # realization 事件
+        if event_type == "realization":
+            if "才明白" in combined or "才懂" in combined:
+                return "后来我才明白"
+            if "原来" in combined:
+                return "原来不是我的问题"
+            return "我终于懂了"
+
+        return event_desc
+
+    def build_from_chat(
+        self,
+        chat_messages: list,
+        emotion_vector: 'EmotionVector',
+        profile: 'HumanProfile' = None
+    ) -> dict:
+        """
+        从聊天构建叙事骨架
+
+        Returns:
+            {
+                "events": ["event1", "event2", ...],  # 歌词事件列表
+                "speaker": "我",  # 叙事视角
+                "target": "你",  # 叙述对象
+                "arc": "heartbreak",  # 叙事弧线
+                "perspective": "second_person",  # 第一/第二人称
+            }
+        """
+        # 1. 事件抽取
+        events = self._extract_events(chat_messages, emotion_vector)
+
+        # 2. 视角统一
+        unified_events = self._unify_perspective(events)
+
+        # 3. 选择叙事弧线
+        arc_type = self._detect_arc_type(emotion_vector)
+
+        # 4. 构建叙事骨架
+        narrative = self._build_narrative_arc(unified_events, arc_type, profile)
+
+        self.last_narrative = narrative
+        return narrative
+
+    def _extract_events(self, chat_messages: list, emotion_vector: 'EmotionVector') -> list:
+        """
+        从聊天抽取关键事件（v9.3: 用原句重写，不用模板句子）
+
+        输出格式：[(event_type, rewritten_event_desc), ...]
+        """
+        events = []
+
+        # v9.3: 保留原始聊天上下文
+        message_texts = []
+        for msg in chat_messages:
+            if isinstance(msg, dict):
+                message_texts.append(msg.get('content', ''))
+            else:
+                message_texts.append(str(msg))
+        self._chat_context = message_texts
+
+        combined = " ".join(message_texts)
+
+        # 情绪信号 → 事件映射（v9.3: 用 _rewrite_from_chat 重写）
+        primary, intensity = emotion_vector.get_primary()
+
+        # sadness / regret → 分离/失落事件
+        if emotion_vector.sadness > 0.4 or emotion_vector.regret > 0.4:
+            if any(w in combined for w in ['分手', '分开', '离开']):
+                events.append(('distance', self._rewrite_from_chat('你离开的那一刻', 'distance')))
+            if any(w in combined for w in ['不回复', '不回', '已读', '秒回']):
+                events.append(('silence', self._rewrite_from_chat('你开始不回消息', 'silence')))
+            if any(w in combined for w in ['哭', '难过', '难受']):
+                events.append(('pain', self._rewrite_from_chat('我一个人哭到深夜', 'pain')))
+
+        # nostalgia → 回忆事件
+        if emotion_vector.nostalgia > 0.4:
+            if any(w in combined for w in ['以前', '以前会', '那时候']):
+                events.append(('distance', self._rewrite_from_chat('你以前会主动找我', 'distance')))
+            events.append(('pain', self._rewrite_from_chat('那些回忆反复出现', 'pain')))
+
+        # anger → 积累/爆发事件
+        if emotion_vector.anger > 0.3:
+            if any(w in combined for w in ['凭什么', '为什么', '不公平']):
+                events.append(('self_doubt', self._rewrite_from_chat('我凭什么要受这些', 'self_doubt')))
+
+        # loneliness → 孤立事件
+        if emotion_vector.loneliness > 0.4:
+            events.append(('self_doubt', self._rewrite_from_chat('只有我一个人在撑着', 'self_doubt')))
+
+        # hope → 期待/失望事件
+        if emotion_vector.hope > 0.3:
+            if any(w in combined for w in ['等', '期待', '希望']):
+                events.append(('doubt', self._rewrite_from_chat('我在等一个解释', 'doubt')))
+
+        # 如果没有提取到，用情绪本身作为事件
+        if not events:
+            events.append((primary, f'这{primary}的情绪'))
+
+        # 去重但保留顺序
+        seen = set()
+        deduped = []
+        for e in events:
+            if e[1] not in seen:
+                seen.add(e[1])
+                deduped.append(e)
+
+        return deduped
+
+    def _unify_perspective(self, events: list) -> list:
+        """
+        统一叙事视角：全是"我"在说，"你"是被叙述对象
+
+        微信里可能有：
+        - "你怎么不回我"（质问）
+        - "他不回我"（第三方）
+
+        歌词里统一变成：
+        - "{target}不回消息那天"
+        - "我反复确认"
+        """
+        unified = []
+        for event_type, event_desc in events:
+            # 替换人称代词为固定视角
+            desc = event_desc
+            desc = desc.replace("你", "{target}")
+            desc = desc.replace("我", "{self}")
+            desc = desc.replace("他", "{target}")
+            desc = desc.replace("她", "{target}")
+
+            # 还原为歌词视角
+            desc = desc.replace("{target}", "你")
+            desc = desc.replace("{self}", "我")
+
+            unified.append((event_type, desc))
+
+        return unified
+
+    def _detect_arc_type(self, emotion_vector: 'EmotionVector') -> str:
+        """根据情绪向量选择叙事弧线"""
+        if emotion_vector.sadness > 0.5 and emotion_vector.regret > 0.4:
+            return "heartbreak"
+        elif emotion_vector.nostalgia > 0.5:
+            return "nostalgia"
+        elif emotion_vector.regret > 0.5:
+            return "regret"
+        elif emotion_vector.hope > 0.3 and emotion_vector.loneliness > 0.3:
+            return "longing"
+        return "heartbreak"
+
+    def _build_narrative_arc(
+        self,
+        events: list,
+        arc_type: str,
+        profile: 'HumanProfile' = None
+    ) -> dict:
+        """
+        v9.3 构建叙事弧：每个事件展开2-3行，加转折句
+
+        歌词结构：
+        [开场] - 场景设定
+        [主歌1] - 事件展开（每个事件扩2-3行）
+        [转折句] - 情绪转折点
+        [主歌2] - 情绪升级 + 矛盾爆发
+        [结尾] - 情绪收束
+        """
+        import random
+        arc_sequence = self.NARRATIVE_ARCS.get(arc_type, self.NARRATIVE_ARCS["heartbreak"])
+
+        lyric_lines = []
+
+        # v9.3: 每个事件展开
+        for i, (event_type, event_desc) in enumerate(events):
+            # 开场用事件本身
+            if i == 0:
+                lyric_lines.append(('intro', event_desc))
+            # 后续事件根据位置分配 verse1 / verse2
+            else:
+                # v9.3: 第一个后续事件归 verse1，其余归 verse2
+                section = 'verse1' if i == 1 else 'verse2'
+                lyric_lines.append((section, event_desc))
+
+                # v9.3: 每个事件扩2行
+                expansions = self.EVENT_EXPANSION_TEMPLATES.get(event_type, [])
+                if expansions:
+                    for exp in expansions[:2]:
+                        lyric_lines.append((section, exp))
+
+        # v9.3: 在 verse2 前插入转折句（如果 verse2 不存在则加在 verse1 后）
+        verse2_indices = [i for i, (s, _) in enumerate(lyric_lines) if s == 'verse2']
+        if verse2_indices:
+            # verse2 存在，插在 verse2 开头
+            insert_pos = verse2_indices[0]
+        elif len(events) >= 2:
+            # verse2 不存在但有足够事件，插在 verse1 最后之后
+            verse1_end = max([i for i, (s, _) in enumerate(lyric_lines) if s == 'verse1'] + [0])
+            insert_pos = verse1_end + 1
+        else:
+            insert_pos = None
+
+        if insert_pos is not None:
+            turning_point = random.choice(self.TURNING_POINT_TEMPLATES)
+            lyric_lines.insert(insert_pos, ('turning', turning_point))
+
+        # 结尾（情绪收束）
+        if events:
+            _, last = events[-1]
+            outro_options = [
+                "原来已经回不去了",
+                "你已经不是从前的你了",
+                "我们早就散了",
+            ]
+            lyric_lines.append(('outro', random.choice(outro_options)))
+
+        return {
+            "events": events,
+            "arc_type": arc_type,
+            "lyric_lines": lyric_lines,
+            "speaker": "我",
+            "target": "你",
+        }
+
+    def events_to_lines(self, narrative: dict) -> list:
+        """
+        把叙事骨架转换成歌词行（供 LyricRenderer 使用）
+
+        输入：narrative["lyric_lines"]
+        输出：[line1, line2, ...] 歌词行列表
+        """
+        lines = []
+        current_section = None
+
+        section_markers = {
+            'intro': '【开场】',
+            'verse1': '【主歌1】',
+            'verse2': '【主歌2】',
+            'turning': '【转折】',
+            'hook': '【Hook】',
+            'outro': '【结尾】',
+        }
+
+        for section, text in narrative["lyric_lines"]:
+            if section != current_section:
+                marker = section_markers.get(section, f'【{section}】')
+                lines.append(marker)
+                current_section = section
+            lines.append(text)
+
+        return lines
 
 
 # ==================== Art Layer: Lyric Renderer ====================
@@ -1925,6 +2667,7 @@ class ArtPipeline:
         self.renderer = LyricRenderer()
         self.hook_generator = HookGenerator()
         self.humanizer = HumanRewriteLayer(intensity=0.3)  # v7.9: 人类化算子
+        self.narrative_builder = NarrativeBuilder()  # v9.2: 叙事构建器
         self.enable_humanize = humanize
         self.generation_count = 0
         self.last_emotion_bias = None
@@ -1933,6 +2676,7 @@ class ArtPipeline:
         self.last_emotion_curve = None
         self.last_humanized = None
         self.last_profile = None
+        self.last_narrative = None
 
     def run(self, chat_messages: List[Dict], user_feedback: str = "") -> Dict:
         """
@@ -1949,6 +2693,12 @@ class ArtPipeline:
         profile_type = HumanProfileLibrary.detect_from_emotion(emotion_vector)
         profile = HumanProfileLibrary.get_profile(profile_type)
         self.last_profile = profile
+
+        # v9.2: 构建叙事骨架（事件抽取 + 视角统一）
+        narrative = self.narrative_builder.build_from_chat(
+            chat_messages, emotion_vector, profile
+        )
+        self.last_narrative = narrative
 
         # v7.8: 自动检测风格和情绪曲线
         style = StylePresetLibrary.detect_from_emotion(emotion_vector)
@@ -1968,7 +2718,10 @@ class ArtPipeline:
         self.last_hook = hook
 
         lyric_plan = self.planner.plan(emotion_vector, compression_result["imagery_tokens"])
-        prompt_parts = self.planner.generate_prompt_parts(compression_result, lyric_plan)
+        # v9.2: 把叙事骨架传给 prompt 生成
+        prompt_parts = self.planner.generate_prompt_parts(
+            compression_result, lyric_plan, narrative=narrative
+        )
         lyrics = self.renderer.render(
             prompt_parts,
             emotion_vector,
@@ -1995,6 +2748,7 @@ class ArtPipeline:
             "compression": compression_result,
             "emotion_vector": emotion_vector,
             "profile": profile,  # v8.1: 返回使用的人格
+            "narrative": narrative,  # v9.2: 叙事骨架
             "plan": lyric_plan,
             "prompt_parts": prompt_parts,
             "imagery": compression_result["imagery_tokens"],
