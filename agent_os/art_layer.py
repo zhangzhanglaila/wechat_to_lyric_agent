@@ -465,16 +465,17 @@ class LyricPlanner:
         return parts
 
     def _format_narrative(self, narrative: Dict) -> str:
-        """v9.3: 格式化叙事骨架到提示词"""
+        """v9.5: 格式化叙事骨架到提示词"""
         lines = ["\n叙事骨架（按此弧线展开歌词）："]
         arc_type = narrative.get("arc_type", "heartbreak")
         lines.append(f"叙事弧线：{arc_type}")
 
-        events = narrative.get("events", [])
-        if events:
+        frames = narrative.get("events", [])
+        if frames:
             lines.append("叙事事件（每个事件扩2-3句）：")
-            for event_type, event_desc in events:
-                lines.append(f"- {event_desc}")
+            for frame in frames:
+                # v9.5: events 是 List[SemanticFrame]
+                lines.append(f"- [{frame.core}] {frame.trigger}")
 
         lines.append(f"叙事视角：第一人称（我对你说）")
         lines.append("歌词要求（严格遵守）：")
@@ -2084,6 +2085,60 @@ class HumanRewriteLayer:
 
 # ==================== Art Layer: Narrative Builder (v9.2) ====================
 
+# v9.5 语义帧 schema 约束
+VALID_CORES = frozenset([
+    "silence", "distance", "doubt", "self_doubt",
+    "pain", "resignation", "realization"
+])
+VALID_TENSIONS = frozenset([
+    "expectation_fall", "contrast", "reversal", "stable", "rising", "release"
+])
+VALID_EMOTIONS = frozenset([
+    "anxiety", "sadness", "hope", "relief", "anger",
+    "nostalgia", "loneliness", "calm", "confusion", "resignation"
+])
+
+
+@dataclass
+class SemanticFrame:
+    """
+    v9.5 语义帧：structured representation of an event
+
+    不再是 (event_type, event_desc) 的二元组
+    而是包含完整语义信息的结构：
+
+    - core: 核心事件类型（silence/distance/doubt/self_doubt/pain/resignation/realization）
+    - trigger: 聊天原句中的触发短语（"秒回变沉默"）
+    - behavior: 叙事行为/心理动作（waiting_anxiously/retrospection/realization）
+    - emotion: 情绪标签（anxiety/sadness/hope/relief）
+    - tension: 张力类型（expectation_fall/contrast/reversal/stable）
+    - direction: 情绪走向（rising/falling/stable）
+    """
+    core: str
+    trigger: str
+    behavior: str
+    emotion: str
+    tension: str
+    direction: str = "stable"
+
+    def validate(self) -> 'SemanticFrame':
+        """v9.5: 确保 frame 字段合法，防止漂移"""
+        if self.core not in VALID_CORES:
+            self.core = "pain"  # fallback to neutral
+        if not self.behavior:
+            self.behavior = "unknown"
+        if self.tension not in VALID_TENSIONS:
+            self.tension = "stable"
+        if self.emotion not in VALID_EMOTIONS:
+            self.emotion = "sadness"
+        if self.direction not in ("rising", "falling", "stable"):
+            self.direction = "stable"
+        return self
+
+    def __str__(self):
+        return f"SemanticFrame({self.core}|{self.behavior}|{self.tension})"
+
+
 class NarrativeBuilder:
     """
     v9.2 Narrative Builder - 聊天 → 叙事骨架 → 歌词结构
@@ -2104,6 +2159,10 @@ class NarrativeBuilder:
         ↓
     Lyric-ready Event List
     """
+
+    def __init__(self):
+        self.last_narrative = None
+        self._expansion_cache = set()  # v9.5: 防止同一行重复出现
 
     # 事件模板：从聊天行为映射到歌词事件
     EVENT_TEMPLATES = {
@@ -2160,6 +2219,129 @@ class NarrativeBuilder:
         "直到你走了我才",
     ]
 
+    # v9.6: 意象词库 - 让歌词从"解释"变成"有画面"
+    IMAGERY = {
+        "silence": ["已读不回的对话框", "灰掉的头像", "凌晨三点的屏幕", "消息框空空的"],
+        "distance": ["两条平行线", "越走越远的背影", "中间隔着的沉默", "再也够不到的距离"],
+        "doubt": ["那句话的语气", "那天的表情", "反复回味的细节", "说不出口的疑问"],
+        "self_doubt": ["那句话", "那天的语气", "自己的影子", "越来越小的自己"],
+        "pain": ["喉咙里的哽咽", "眼眶里打转的泪", "深夜醒来的时刻", "抱紧自己的手臂"],
+        "resignation": ["算了这两个字", "假装没发生过", "笑着说没事", "不再追问的沉默"],
+        "realization": ["碎掉的东西", "回不去的那天", "醒过来的早晨", "空荡荡的房间"],
+    }
+
+    # v9.6: 画面句模板 - 替换原来的解释句
+    VISUAL_TEMPLATES = {
+        ("silence", "waiting_anxiously"): [
+            "我把聊天框翻了一遍又一遍",
+            "屏幕亮着 却等不到一个表情",
+        ],
+        ("silence", "refresh_repeatedly"): [
+            "我一遍遍刷新 看你有没有上线",
+            "每一条消息 都石沉大海",
+        ],
+        ("silence", "staring_screen"): [
+            "我盯着那个对话框发了很久的呆",
+            "输入法打了一半 又全部删掉",
+        ],
+        ("distance", "retrospection"): [
+            "那些天的聊天记录 我翻到屏幕都发烫",
+            "以为这样就能回到从前",
+        ],
+        ("distance", "realizing_change"): [
+            "原来你早就不是我认识的那个人了",
+            "只是我后知后觉",
+        ],
+        ("distance", "reaching_out"): [
+            "我试着靠近 你却往后退了一步",
+            "距离这种东西 我终于看清了",
+        ],
+        ("doubt", "retrospection"): [
+            "我问了自己一百遍",
+            "是不是我想太多了",
+        ],
+        ("doubt", "overthinking"): [
+            "那些细节在脑子里翻来覆去",
+            "想得越多 越没有答案",
+        ],
+        ("self_doubt", "self_blame"): [
+            "我把那天的话翻了又翻",
+            "还是找不到沉默的原因",
+        ],
+        ("self_doubt", "carrying_alone"): [
+            "好像只有我一个人在乎这段关系",
+            "撑得好累 但不敢放手",
+        ],
+        ("pain", "crying"): [
+            "眼泪在眼眶里打转",
+            "却不知道该怪谁",
+        ],
+        ("pain", "overthinking"): [
+            "想到睡不着 想到天亮",
+            "想到连做梦都在想",
+        ],
+        ("resignation", "giving_up"): [
+            "我跟自己说算了",
+            "想多了也只是为难自己",
+        ],
+        ("resignation", "pretending"): [
+            "我假装什么都没发生",
+            "假装一切如常",
+        ],
+        ("realization", "sudden_awakening"): [
+            "原来从头到尾",
+            "只是我一个人在撑",
+        ],
+        ("realization", "seeing_clearly"): [
+            "我终于看清了",
+            "只是看清了也回不去了",
+        ],
+    }
+
+    # v9.6: turning punch lines（爆点句）
+    TURNING_PUNCH_LINES = [
+        "你不是没回 只是没想回我",
+        "原来早就散了 只是我不愿承认",
+        "不是距离远了 是心远了",
+        "那句话之后 我们就没再说过话了",
+        "不是你不回 是你早就不想回了",
+    ]
+
+    # v9.7: Hook模板 - 按core分组的爆款候选句
+    HOOK_TEMPLATES = {
+        "silence": [
+            "你不是没回\n只是没想回我",
+            "那条消息\n你看到了也没回",
+            "我删了又打的那句话\n你永远都不会看见",
+        ],
+        "distance": [
+            "我们不是吵散的\n是慢慢不说话了",
+            "不是距离远了\n是心远了",
+            "你一句“在忙”\n我等了一整晚",
+        ],
+        "self_doubt": [
+            "我反复想的那句话\n其实根本不重要",
+            "我以为是我不够好\n后来才知道不是",
+            "我把错都给了自己\n却不知道问题不在我",
+        ],
+        "doubt": [
+            "我问了自己一百遍\n是不是我想太多",
+            "那些细节在脑子里\n翻来覆去睡不着",
+        ],
+        "pain": [
+            "眼泪在眼眶里打转\n却不知道该怪谁",
+            "想到天亮\n想到连梦都在想",
+        ],
+        "resignation": [
+            "算了这两个字\n我说了无数次",
+            "我假装没事\n假装一切如常",
+        ],
+        "realization": [
+            "原来从头到尾\n只是我一个人在撑",
+            "看清了也回不去\n回不去也只能认",
+        ],
+    }
+
     # v9.3: 事件扩展模板
     EVENT_EXPANSION_TEMPLATES = {
         "silence": [
@@ -2193,87 +2375,250 @@ class NarrativeBuilder:
         ],
     }
 
-    def __init__(self):
-        self.last_narrative = None
-        self._chat_context = []  # 保留原始聊天上下文用于rewrite
-
     # ==================== v9.3 Event Rewrite ====================
 
-    def _rewrite_from_chat(self, event_desc: str, event_type: str) -> str:
+    def _build_semantic_frame(self, event_type: str) -> 'SemanticFrame':
         """
-        v9.3: 从聊天原句中提取信息，重写事件描述
+        v9.5 核心升级：从聊天上下文构建语义帧
 
-        不用模板句子，而是从实际聊天内容中提炼
-        这样事件描述会更具体、更像用户自己的话
+        不再返回字符串，而是返回完整的 SemanticFrame
+        包含：trigger（事件短语）、behavior（心理动作）、emotion、tension、direction
+
+        这使得 expand 时能基于"语义帧"而非"关键词匹配"
         """
-        # 用原始聊天上下文匹配最相似的句子，重写为歌词风格
         if not self._chat_context:
-            return event_desc
+            return SemanticFrame(
+                core=event_type,
+                trigger=f"这{event_type}的情绪",
+                behavior="unknown",
+                emotion="sadness",
+                tension="stable"
+            )
 
         combined = " ".join(self._chat_context)
 
-        # silence 事件：从"不回"相关句子提取关键词
+        # === 根据 event_type 和聊天内容构建语义帧 ===
+
         if event_type == "silence":
             if "秒回" in combined:
-                # 用户提到过对比
-                return "你从秒回变成沉默那天"
-            if "突然" in combined:
-                return "你突然就不再说话了"
-            if "等" in combined:
-                return "我等了一夜没有回复"
-            return "你开始不回消息"
+                return SemanticFrame(
+                    core="silence",
+                    trigger="你从秒回变成沉默",
+                    behavior="waiting_anxiously",
+                    emotion="anxiety",
+                    tension="expectation_fall",
+                    direction="rising"
+                )
+            elif "突然" in combined:
+                return SemanticFrame(
+                    core="silence",
+                    trigger="你突然就不再说话",
+                    behavior="refresh_repeatedly",
+                    emotion="anxiety",
+                    tension="contrast",
+                    direction="rising"
+                )
+            elif "不回" in combined or "已读" in combined:
+                return SemanticFrame(
+                    core="silence",
+                    trigger="你开始不回消息",
+                    behavior="staring_screen",
+                    emotion="sadness",
+                    tension="stable",
+                    direction="stable"
+                )
+            else:
+                return SemanticFrame(
+                    core="silence",
+                    trigger="你不再像以前那样",
+                    behavior="waiting_hopefully",
+                    emotion="hope",
+                    tension="expectation_fall",
+                    direction="falling"
+                )
 
-        # distance 事件
-        if event_type == "distance":
+        elif event_type == "distance":
             if "以前" in combined or "那时候" in combined:
-                # 找"以前..."的句子
-                return "你以前不是这样的"
-            if "变了" in combined:
-                return "我们好像变了"
-            return "你离我越来越远"
+                return SemanticFrame(
+                    core="distance",
+                    trigger="你以前不是这样的",
+                    behavior="retrospection",
+                    emotion="nostalgia",
+                    tension="contrast",
+                    direction="falling"
+                )
+            elif "变了" in combined:
+                return SemanticFrame(
+                    core="distance",
+                    trigger="我们好像都变了",
+                    behavior="realizing_change",
+                    emotion="sadness",
+                    tension="reversal",
+                    direction="falling"
+                )
+            else:
+                return SemanticFrame(
+                    core="distance",
+                    trigger="你离我越来越远",
+                    behavior="reaching_out",
+                    emotion="sadness",
+                    tension="stable",
+                    direction="falling"
+                )
 
-        # doubt 事件
-        if event_type == "doubt":
-            if "是不是" in combined:
-                # 用户的原句"是不是我哪里做错了"
-                return "我反复问自己是不是我的错"
-            if "确认" in combined:
-                return "我在等一个确切的答案"
-            return "我开始怀疑这一切"
+        elif event_type == "doubt":
+            if "是不是" in combined or "确认" in combined:
+                return SemanticFrame(
+                    core="doubt",
+                    trigger="是不是我哪里做错了",
+                    behavior="retrospection",
+                    emotion="anxiety",
+                    tension="stable",
+                    direction="rising"
+                )
+            elif "等" in combined or "期待" in combined:
+                return SemanticFrame(
+                    core="doubt",
+                    trigger="我在等一个解释",
+                    behavior="hoping",
+                    emotion="hope",
+                    tension="stable",
+                    direction="stable"
+                )
+            else:
+                return SemanticFrame(
+                    core="doubt",
+                    trigger="我开始怀疑这一切",
+                    behavior="overthinking",
+                    emotion="anxiety",
+                    tension="rising",
+                    direction="rising"
+                )
 
-        # self_doubt 事件
-        if event_type == "self_doubt":
-            if "我哪里" in combined or "是不是" in combined:
-                return "是不是我哪里做错了"
-            if "凭什么" in combined:
-                return "我凭什么要受这些"
-            return "只有我一个人在撑着"
+        elif event_type == "self_doubt":
+            if "我哪里" in combined or "是不是我" in combined:
+                return SemanticFrame(
+                    core="self_doubt",
+                    trigger="是不是我哪里做错了",
+                    behavior="self_blame",
+                    emotion="sadness",
+                    tension="stable",
+                    direction="rising"
+                )
+            elif "凭什么" in combined:
+                return SemanticFrame(
+                    core="self_doubt",
+                    trigger="我凭什么要受这些",
+                    behavior="questioning_fairness",
+                    emotion="anger",
+                    tension="rising",
+                    direction="rising"
+                )
+            else:
+                return SemanticFrame(
+                    core="self_doubt",
+                    trigger="只有我一个人在撑着",
+                    behavior="carrying_alone",
+                    emotion="loneliness",
+                    tension="stable",
+                    direction="stable"
+                )
 
-        # pain 事件
-        if event_type == "pain":
+        elif event_type == "pain":
             if "哭" in combined:
-                return "那晚我哭到喘不上气"
-            if "想" in combined:
-                return "我一个人想到天亮"
-            return "那种痛说不出来"
+                return SemanticFrame(
+                    core="pain",
+                    trigger="那晚我哭到喘不上气",
+                    behavior="crying",
+                    emotion="sadness",
+                    tension="release",
+                    direction="rising"
+                )
+            elif "想" in combined or "想不通" in combined:
+                return SemanticFrame(
+                    core="pain",
+                    trigger="想到天亮也没想通",
+                    behavior="overthinking",
+                    emotion="confusion",
+                    tension="rising",
+                    direction="stable"
+                )
+            else:
+                return SemanticFrame(
+                    core="pain",
+                    trigger="那种感觉说不出来",
+                    behavior="suppressing",
+                    emotion="sadness",
+                    tension="stable",
+                    direction="stable"
+                )
 
-        # resignation 事件
-        if event_type == "resignation":
+        elif event_type == "resignation":
             if "算了" in combined:
-                return "我告诉自己算了"
-            if "假装" in combined:
-                return "我假装什么都没发生"
-            return "我不再问了你"
+                return SemanticFrame(
+                    core="resignation",
+                    trigger="我告诉自己算了",
+                    behavior="giving_up",
+                    emotion="relief",
+                    tension="release",
+                    direction="falling"
+                )
+            elif "假装" in combined:
+                return SemanticFrame(
+                    core="resignation",
+                    trigger="我假装什么都没发生",
+                    behavior="pretending",
+                    emotion="sadness",
+                    tension="stable",
+                    direction="stable"
+                )
+            else:
+                return SemanticFrame(
+                    core="resignation",
+                    trigger="我不再问你了",
+                    behavior="withdrawing",
+                    emotion="resignation",
+                    tension="falling",
+                    direction="falling"
+                )
 
-        # realization 事件
-        if event_type == "realization":
+        elif event_type == "realization":
             if "才明白" in combined or "才懂" in combined:
-                return "后来我才明白"
-            if "原来" in combined:
-                return "原来不是我的问题"
-            return "我终于懂了"
+                return SemanticFrame(
+                    core="realization",
+                    trigger="后来我才明白",
+                    behavior="sudden_awakening",
+                    emotion="relief",
+                    tension="reversal",
+                    direction="falling"
+                )
+            elif "原来" in combined:
+                return SemanticFrame(
+                    core="realization",
+                    trigger="原来不是我的问题",
+                    behavior="understanding",
+                    emotion="relief",
+                    tension="release",
+                    direction="falling"
+                )
+            else:
+                return SemanticFrame(
+                    core="realization",
+                    trigger="我终于看清了",
+                    behavior="seeing_clearly",
+                    emotion="calm",
+                    tension="stable",
+                    direction="stable"
+                )
 
-        return event_desc
+        # fallback
+        return SemanticFrame(
+            core=event_type,
+            trigger=f"这{event_type}的情绪",
+            behavior="unknown",
+            emotion="sadness",
+            tension="stable"
+        ).validate()
 
     def build_from_chat(
         self,
@@ -2282,39 +2627,39 @@ class NarrativeBuilder:
         profile: 'HumanProfile' = None
     ) -> dict:
         """
-        从聊天构建叙事骨架
+        从聊天构建叙事骨架（v9.5: 返回 List[SemanticFrame]）
 
         Returns:
             {
-                "events": ["event1", "event2", ...],  # 歌词事件列表
+                "events": [SemanticFrame, ...],  # 歌词事件列表
                 "speaker": "我",  # 叙事视角
                 "target": "你",  # 叙述对象
                 "arc": "heartbreak",  # 叙事弧线
                 "perspective": "second_person",  # 第一/第二人称
             }
         """
-        # 1. 事件抽取
-        events = self._extract_events(chat_messages, emotion_vector)
+        # v9.5: 每次构建清空 expansion 缓存
+        self._expansion_cache.clear()
 
-        # 2. 视角统一
-        unified_events = self._unify_perspective(events)
+        # 1. v9.5: 语义帧抽取（视角已在 frame 内统一）
+        frames = self._extract_events(chat_messages, emotion_vector)
 
-        # 3. 选择叙事弧线
+        # 2. 选择叙事弧线
         arc_type = self._detect_arc_type(emotion_vector)
 
-        # 4. 构建叙事骨架
-        narrative = self._build_narrative_arc(unified_events, arc_type, profile)
+        # 3. 构建叙事骨架
+        narrative = self._build_narrative_arc(frames, arc_type, profile)
 
         self.last_narrative = narrative
         return narrative
 
     def _extract_events(self, chat_messages: list, emotion_vector: 'EmotionVector') -> list:
         """
-        从聊天抽取关键事件（v9.3: 用原句重写，不用模板句子）
+        从聊天抽取关键事件（v9.5: 返回 List[SemanticFrame]）
 
-        输出格式：[(event_type, rewritten_event_desc), ...]
+        输出格式：[SemanticFrame, ...]
         """
-        events = []
+        frames = []
 
         # v9.3: 保留原始聊天上下文
         message_texts = []
@@ -2327,80 +2672,204 @@ class NarrativeBuilder:
 
         combined = " ".join(message_texts)
 
-        # 情绪信号 → 事件映射（v9.3: 用 _rewrite_from_chat 重写）
+        # v9.5: 情绪信号 → 语义帧映射
         primary, intensity = emotion_vector.get_primary()
 
         # sadness / regret → 分离/失落事件
         if emotion_vector.sadness > 0.4 or emotion_vector.regret > 0.4:
             if any(w in combined for w in ['分手', '分开', '离开']):
-                events.append(('distance', self._rewrite_from_chat('你离开的那一刻', 'distance')))
+                frames.append(self._build_semantic_frame('distance'))
             if any(w in combined for w in ['不回复', '不回', '已读', '秒回']):
-                events.append(('silence', self._rewrite_from_chat('你开始不回消息', 'silence')))
+                frames.append(self._build_semantic_frame('silence'))
             if any(w in combined for w in ['哭', '难过', '难受']):
-                events.append(('pain', self._rewrite_from_chat('我一个人哭到深夜', 'pain')))
+                frames.append(self._build_semantic_frame('pain'))
 
         # nostalgia → 回忆事件
         if emotion_vector.nostalgia > 0.4:
             if any(w in combined for w in ['以前', '以前会', '那时候']):
-                events.append(('distance', self._rewrite_from_chat('你以前会主动找我', 'distance')))
-            events.append(('pain', self._rewrite_from_chat('那些回忆反复出现', 'pain')))
+                frames.append(self._build_semantic_frame('distance'))
+            frames.append(self._build_semantic_frame('pain'))
 
         # anger → 积累/爆发事件
         if emotion_vector.anger > 0.3:
             if any(w in combined for w in ['凭什么', '为什么', '不公平']):
-                events.append(('self_doubt', self._rewrite_from_chat('我凭什么要受这些', 'self_doubt')))
+                frames.append(self._build_semantic_frame('self_doubt'))
 
         # loneliness → 孤立事件
         if emotion_vector.loneliness > 0.4:
-            events.append(('self_doubt', self._rewrite_from_chat('只有我一个人在撑着', 'self_doubt')))
+            frames.append(self._build_semantic_frame('self_doubt'))
 
         # hope → 期待/失望事件
         if emotion_vector.hope > 0.3:
             if any(w in combined for w in ['等', '期待', '希望']):
-                events.append(('doubt', self._rewrite_from_chat('我在等一个解释', 'doubt')))
+                frames.append(self._build_semantic_frame('doubt'))
 
         # 如果没有提取到，用情绪本身作为事件
-        if not events:
-            events.append((primary, f'这{primary}的情绪'))
+        if not frames:
+            frames.append(self._build_semantic_frame(primary))
 
-        # 去重但保留顺序
+        # 去重但保留顺序（按 trigger 去重）
         seen = set()
         deduped = []
-        for e in events:
-            if e[1] not in seen:
-                seen.add(e[1])
-                deduped.append(e)
+        for f in frames:
+            if f.trigger not in seen:
+                seen.add(f.trigger)
+                deduped.append(f)
 
         return deduped
 
-    def _unify_perspective(self, events: list) -> list:
+    def _expand_from_frame(self, frame: 'SemanticFrame') -> list:
         """
-        统一叙事视角：全是"我"在说，"你"是被叙述对象
+        v9.6 画面化升级：根据语义帧展开为"有画面的歌词句"
 
-        微信里可能有：
-        - "你怎么不回我"（质问）
-        - "他不回我"（第三方）
+        关键升级：
+        - 使用 VISUAL_TEMPLATES 替代解释句
+        - 注入 IMAGERY 意象词增加"身临其境"感
+        - 保证每行都是"让人看到画面"而非"在解释"
 
-        歌词里统一变成：
-        - "{target}不回消息那天"
-        - "我反复确认"
+        Returns:
+            [line1, line2] 展开行列表
         """
-        unified = []
-        for event_type, event_desc in events:
-            # 替换人称代词为固定视角
-            desc = event_desc
-            desc = desc.replace("你", "{target}")
-            desc = desc.replace("我", "{self}")
-            desc = desc.replace("他", "{target}")
-            desc = desc.replace("她", "{target}")
+        lines = []
+        core = frame.core
+        behavior = frame.behavior
+        tension = frame.tension
+        emotion = frame.emotion
 
-            # 还原为歌词视角
-            desc = desc.replace("{target}", "你")
-            desc = desc.replace("{self}", "我")
+        # v9.6: 优先用画面句模板
+        key = (core, behavior)
+        if key in self.VISUAL_TEMPLATES:
+            lines.extend(self.VISUAL_TEMPLATES[key])
+        else:
+            # fallback 到原有逻辑（仍然画面化）
+            # silence 事件族
+            if core == "silence":
+                if behavior == "waiting_anxiously":
+                    lines.append("消息发出去 期待着回复")
+                    lines.append("等到的只是已读")
+                elif behavior == "refresh_repeatedly":
+                    lines.append("我一遍遍刷新聊天框")
+                    lines.append("以为下一秒你就会回来")
+                elif behavior == "staring_screen":
+                    lines.append("我盯着那个对话框发呆")
+                    lines.append("输入法打了又删 删了又打")
+                elif behavior == "waiting_hopefully":
+                    lines.append("消息框空了很久")
+                    lines.append("我不敢再发第二条")
+                else:
+                    lines.append("消息框一直空着")
+                    lines.append("我假装没在等")
 
-            unified.append((event_type, desc))
+            # distance 事件族
+            elif core == "distance":
+                if behavior == "retrospection":
+                    lines.append("我把聊天记录翻了一遍又一遍")
+                    lines.append("屏幕都发烫了")
+                elif behavior == "realizing_change":
+                    lines.append("只是我后知后觉")
+                    lines.append("你早就不是原来的你了")
+                elif behavior == "reaching_out":
+                    lines.append("我试着去靠近你")
+                    lines.append("却发现距离越来越远")
+                else:
+                    lines.append("我们之间好像隔了什么")
+                    lines.append("说不上来")
 
-        return unified
+            # doubt 事件族
+            elif core == "doubt":
+                if behavior == "retrospection":
+                    lines.append("我问了自己一百遍")
+                    lines.append("到底是我想太多了吗")
+                elif behavior == "hoping":
+                    lines.append("我在等一个解释")
+                    lines.append("等到连自己都不信了")
+                elif behavior == "overthinking":
+                    lines.append("那些细节在脑子里翻来覆去")
+                    lines.append("想得越多 越没有答案")
+                else:
+                    lines.append("我想抓住每个细节")
+                    lines.append("却只抓到自己的不安")
+
+            # self_doubt 事件族
+            elif core == "self_doubt":
+                if behavior == "self_blame":
+                    lines.append("我把那天的话翻了又翻")
+                    lines.append("还是找不到沉默的原因")
+                elif behavior == "questioning_fairness":
+                    lines.append("我凭什么要受这些")
+                    lines.append("但我还是选择了忍")
+                elif behavior == "carrying_alone":
+                    lines.append("好像只有我一个人在撑")
+                    lines.append("撑得好累 但不敢说")
+                else:
+                    lines.append("我开始怀疑自己")
+                    lines.append("是不是我真的不够好")
+
+            # pain 事件族
+            elif core == "pain":
+                if behavior == "crying":
+                    lines.append("眼泪在眼眶里打转")
+                    lines.append("却不知道该怪谁")
+                elif behavior == "overthinking":
+                    lines.append("想到睡不着 想到天亮")
+                    lines.append("想到连做梦都在想")
+                elif behavior == "suppressing":
+                    lines.append("那种痛说不出来")
+                    lines.append("只有自己知道有多痛")
+                else:
+                    lines.append("好多话想说")
+                    lines.append("却一句都说不出口")
+
+            # resignation 事件族
+            elif core == "resignation":
+                if behavior == "giving_up":
+                    lines.append("我跟自己说算了")
+                    lines.append("想多了也只是为难自己")
+                elif behavior == "pretending":
+                    lines.append("我假装什么都没发生")
+                    lines.append("假装一切如常")
+                elif behavior == "withdrawing":
+                    lines.append("我不再问你了")
+                    lines.append("问了也不会有答案")
+                else:
+                    lines.append("算了 就这样吧")
+                    lines.append("想多了也没用")
+
+            # realization 事件族
+            elif core == "realization":
+                if behavior == "sudden_awakening":
+                    lines.append("原来从头到尾")
+                    lines.append("只是我一个人在撑")
+                elif behavior == "understanding":
+                    lines.append("原来不是我不够好")
+                    lines.append("只是你不想继续了")
+                elif behavior == "seeing_clearly":
+                    lines.append("我终于看清了")
+                    lines.append("只是看清了也回不去了")
+                else:
+                    lines.append("我以为我懂了")
+                    lines.append("其实还是没有")
+
+        # v9.6: 注入意象词 - 随机替换一句加入 imagery
+        imagery_list = self.IMAGERY.get(core, [])
+        if imagery_list and lines:
+            import random
+            img = random.choice(imagery_list)
+            # 随机替换一行或在某行后追加
+            if len(lines) >= 2 and random.random() > 0.5:
+                # 替换第二行（保留第一行作为钩子）
+                lines[1] = f"看着{img} 我发了很久的呆"
+            else:
+                # 在最后追加一行 imagery
+                lines.append(f"我盯着{img} 不知道说什么")
+
+        # v9.5: 去重 - 防止同一行在多事件展开时重复
+        deduped = []
+        for line in lines:
+            if line not in self._expansion_cache:
+                self._expansion_cache.add(line)
+                deduped.append(line)
+        return deduped
 
     def _detect_arc_type(self, emotion_vector: 'EmotionVector') -> str:
         """根据情绪向量选择叙事弧线"""
@@ -2416,12 +2885,12 @@ class NarrativeBuilder:
 
     def _build_narrative_arc(
         self,
-        events: list,
+        frames: list,
         arc_type: str,
         profile: 'HumanProfile' = None
     ) -> dict:
         """
-        v9.3 构建叙事弧：每个事件展开2-3行，加转折句
+        v9.5 构建叙事弧：基于语义帧展开，加转折句
 
         歌词结构：
         [开场] - 场景设定
@@ -2435,19 +2904,19 @@ class NarrativeBuilder:
 
         lyric_lines = []
 
-        # v9.3: 每个事件展开
-        for i, (event_type, event_desc) in enumerate(events):
-            # 开场用事件本身
+        # v9.5: 每个 frame 展开
+        for i, frame in enumerate(frames):
+            # 开场用 frame.trigger（语义帧的触发短语）
             if i == 0:
-                lyric_lines.append(('intro', event_desc))
+                lyric_lines.append(('intro', frame.trigger))
             # 后续事件根据位置分配 verse1 / verse2
             else:
-                # v9.3: 第一个后续事件归 verse1，其余归 verse2
+                # v9.5: 第一个后续事件归 verse1，其余归 verse2
                 section = 'verse1' if i == 1 else 'verse2'
-                lyric_lines.append((section, event_desc))
+                lyric_lines.append((section, frame.trigger))
 
-                # v9.3: 每个事件扩2行
-                expansions = self.EVENT_EXPANSION_TEMPLATES.get(event_type, [])
+                # v9.5: 用语义帧展开（behavior/tension 驱动）
+                expansions = self._expand_from_frame(frame)
                 if expansions:
                     for exp in expansions[:2]:
                         lyric_lines.append((section, exp))
@@ -2457,7 +2926,7 @@ class NarrativeBuilder:
         if verse2_indices:
             # verse2 存在，插在 verse2 开头
             insert_pos = verse2_indices[0]
-        elif len(events) >= 2:
+        elif len(frames) >= 2:
             # verse2 不存在但有足够事件，插在 verse1 最后之后
             verse1_end = max([i for i, (s, _) in enumerate(lyric_lines) if s == 'verse1'] + [0])
             insert_pos = verse1_end + 1
@@ -2465,12 +2934,13 @@ class NarrativeBuilder:
             insert_pos = None
 
         if insert_pos is not None:
-            turning_point = random.choice(self.TURNING_POINT_TEMPLATES)
+            # v9.6: 使用更有冲击力的 punch line 作为转折
+            turning_point = random.choice(self.TURNING_PUNCH_LINES)
             lyric_lines.insert(insert_pos, ('turning', turning_point))
 
         # 结尾（情绪收束）
-        if events:
-            _, last = events[-1]
+        if frames:
+            last_frame = frames[-1]
             outro_options = [
                 "原来已经回不去了",
                 "你已经不是从前的你了",
@@ -2479,7 +2949,7 @@ class NarrativeBuilder:
             lyric_lines.append(('outro', random.choice(outro_options)))
 
         return {
-            "events": events,
+            "events": frames,  # v9.5: List[SemanticFrame]
             "arc_type": arc_type,
             "lyric_lines": lyric_lines,
             "speaker": "我",

@@ -16,7 +16,9 @@
       "Bash(python test_agent_os.py)",
       "Bash(python -c \"import agent_os; print\\('Import OK'\\)\")",
       "Bash(python -c \"from agent_os import EnhancedAgentOS, ArtPipeline, EmotionVector, LyricRhythmSpec, ChatCompressionLayer; print\\('Import OK'\\)\")",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(find D:/wechat_to_lyric_agent -name \"*.pyc\" -delete)",
+      "Bash(find D:/wechat_to_lyric_agent -name \"__pycache__\" -type d -exec rm -rf {} +)"
     ]
   }
 }
