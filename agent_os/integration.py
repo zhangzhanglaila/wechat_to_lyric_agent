@@ -7,7 +7,8 @@ Integration layer: AgentOSKernel + ArtPipeline + HookGenerator + HumanRewriteLay
 from agent_os import AgentOSKernel, ExecutionGate, StateSnapshotBuilder, StateSnapshot
 from agent_os.art_layer import (
     ArtPipeline, EmotionVector, LyricRhythmSpec, ChatCompressionLayer,
-    StylePreset, EmotionCurve, HookGenerator, StylePresetLibrary, HumanRewriteLayer
+    StylePreset, EmotionCurve, HookGenerator, StylePresetLibrary, HumanRewriteLayer,
+    AudioLayer
 )
 
 
@@ -41,6 +42,7 @@ class EnhancedAgentOS:
         self.hook_generator = HookGenerator()
         self.humanizer = HumanRewriteLayer(intensity=0.3)
         self.compression = ChatCompressionLayer()
+        self.audio_layer = AudioLayer()  # v9.8: 歌词 → 有声作品
         self.gate = ExecutionGate()
         self.use_art_generation = True
 
@@ -99,6 +101,94 @@ class EnhancedAgentOS:
             "humanize_intensity": humanize_intensity,
             "imagery": result["imagery"],
             "generation_count": result["generation_count"]
+        }
+
+    def synthesize_audio(
+        self,
+        chat_messages: list,
+        output_path: str = "output/song.mp3",
+        humanize_intensity: float = 0.3,
+    ) -> dict:
+        """
+        v9.8 主接口：歌词 → 有声作品
+
+        完整pipeline：
+        微信聊天 → 语义帧 → 歌词 → TTS + BGM → 音频文件
+
+        Args:
+            chat_messages: 聊天记录
+            output_path: 输出音频文件路径
+            humanize_intensity: 人类化强度
+
+        Returns:
+            dict: {
+                "lyrics": 歌词文本,
+                "audio_output": 音频文件路径,
+                "duration_sec": 时长,
+                "emotion": 主情绪,
+                "note": 说明,
+            }
+        """
+        # 1. 生成歌词
+        lyric_result = self.generate_lyrics(
+            chat_messages,
+            humanize_intensity=humanize_intensity
+        )
+
+        if "error" in lyric_result:
+            return lyric_result
+
+        # 2. 解析歌词行
+        lyric_lines = []
+        raw_lyrics = lyric_result.get("lyrics", "")
+        lines = raw_lyrics.split("\n")
+
+        # 简单解析：根据【】判断段落
+        current_section = "verse1"
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if "【主歌1】" in line:
+                current_section = "verse1"
+            elif "【主歌2】" in line:
+                current_section = "verse2"
+            elif "【副歌】" in line or "【Hook】" in line:
+                current_section = "hook"
+            elif "【转折】" in line:
+                current_section = "turning"
+            elif "【开场】" in line:
+                current_section = "intro"
+            elif "【结尾】" in line:
+                current_section = "outro"
+            elif line.startswith("【") and line.endswith("】"):
+                current_section = line[1:-1]
+            else:
+                lyric_lines.append((current_section, line))
+
+        if not lyric_lines:
+            return {"error": "No lyric lines parsed"}
+
+        # 3. 获取情绪向量
+        compression_result = self.compression.compress(chat_messages)
+        emotion_vector = compression_result["emotion_vector"]
+
+        # 4. 合成音频
+        audio_result = self.audio_layer.synthesize(
+            lyric_lines,
+            emotion_vector,
+            output_path=output_path,
+        )
+
+        return {
+            "lyrics": lyric_result["lyrics"],
+            "audio_output": audio_result.get("final_output"),
+            "tts_files": audio_result.get("tts_files", []),
+            "duration_sec": audio_result.get("duration_sec", 0),
+            "emotion": audio_result.get("primary_emotion", "unknown"),
+            "voice": audio_result.get("voice", "unknown"),
+            "bgm_file": audio_result.get("bgm_file"),
+            "note": audio_result.get("note", ""),
         }
 
     # 保留旧接口（向后兼容）

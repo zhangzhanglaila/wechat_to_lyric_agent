@@ -2869,7 +2869,13 @@ class NarrativeBuilder:
             if line not in self._expansion_cache:
                 self._expansion_cache.add(line)
                 deduped.append(line)
-        return deduped
+
+        # v9.7: 去除句内相似感（，相邻行前6字相同则去重）
+        filtered = []
+        for line in deduped:
+            if not filtered or line[:6] != filtered[-1][:6]:
+                filtered.append(line)
+        return filtered
 
     def _detect_arc_type(self, emotion_vector: 'EmotionVector') -> str:
         """根据情绪向量选择叙事弧线"""
@@ -2934,8 +2940,14 @@ class NarrativeBuilder:
             insert_pos = None
 
         if insert_pos is not None:
-            # v9.6: 使用更有冲击力的 punch line 作为转折
-            turning_point = random.choice(self.TURNING_PUNCH_LINES)
+            # v9.7: Hook由frame.conditioned生成，而非随机
+            # 使用verse1最末帧的core来选hook（最成熟的情绪点）
+            hook_frame = frames[-1] if frames else None
+            if hook_frame and hook_frame.core in self.HOOK_TEMPLATES:
+                hooks = self.HOOK_TEMPLATES[hook_frame.core]
+                turning_point = random.choice(hooks)
+            else:
+                turning_point = random.choice(self.TURNING_PUNCH_LINES)
             lyric_lines.insert(insert_pos, ('turning', turning_point))
 
         # 结尾（情绪收束）
@@ -3566,3 +3578,415 @@ class ArtPipeline:
 
     def get_last_emotion(self) -> Optional[EmotionVector]:
         return self.emotion_engine.emotion_vector
+
+
+# ==================== Melody Layer: 歌词 → 音符序列 ====================
+# v9.9: MelodyPlanner - 歌词 → Melody IR（中间协议层）
+
+
+@dataclass
+class Note:
+    """
+    Melody IR - 单音符表示
+    一字一音（最简版本）
+    """
+    pitch: str       # 音高，如 "C4", "D#4", "REST"
+    duration: float  # 持续秒数
+    lyric: str       # 对应的字
+
+
+@dataclass
+class MelodyPlan:
+    """完整旋律规划"""
+    key: str         # 调式，如 "C_major", "A_minor"
+    bpm: int         # 节拍，如 70, 85, 110
+    notes: list      # List[Note]
+
+
+class MelodyPlanner:
+    """
+    v9.9 MelodyPlanner - 歌词 → 旋律 IR
+
+    功能：
+    1. 将歌词行转换为音符序列（Melody IR）
+    2. 情绪 → 调式/BPM 映射（核心差异化）
+    3. 是 DiffSinger / So-VITS-SVC 的前置协议层
+
+    使用方式：
+        planner = MelodyPlanner()
+        plan = planner.plan([('verse1', '你不是没回'), ('turning', '只是没想回')], emotion_vector)
+        # plan.key → "A_minor"
+        # plan.bpm → 70
+        # plan.notes → [Note(pitch="C4", duration=0.5, lyric="你"), ...]
+    """
+
+    # 调式音阶（简单版：C大调 / A小调）
+    SCALES = {
+        "C_major": ["C4", "D4", "E4", "F4", "G4", "A4", "B4"],
+        "G_major": ["G4", "A4", "B4", "C5", "D5", "E5", "F#5"],
+        "A_minor": ["A4", "B4", "C5", "D5", "E5", "F5", "G5"],
+        "E_minor": ["E4", "F#4", "G4", "A4", "B4", "C5", "D5"],
+        "D_minor": ["D4", "E4", "F4", "G4", "A4", "Bb4", "C5"],
+    }
+
+    # 情绪 → 调式映射
+    KEY_MAP = {
+        "sadness": "A_minor",
+        "nostalgia": "E_minor",
+        "loneliness": "D_minor",
+        "regret": "A_minor",
+        "anger": "E_minor",
+        "joy": "C_major",
+        "warmth": "G_major",
+        "hope": "G_major",
+        "default": "C_major",
+    }
+
+    # 情绪 → BPM 映射
+    BPM_MAP = {
+        "sadness": 70,
+        "nostalgia": 75,
+        "loneliness": 68,
+        "regret": 72,
+        "anger": 110,
+        "joy": 95,
+        "warmth": 85,
+        "hope": 90,
+        "default": 85,
+    }
+
+    # Hook 句的重复 melody（用于副歌洗脑）
+    HOOK_MELODY = [
+        {"pitch": "C4", "duration": 0.5},
+        {"pitch": "E4", "duration": 0.5},
+        {"pitch": "G4", "duration": 0.5},
+        {"pitch": "E4", "duration": 0.5},
+        {"pitch": "C4", "duration": 1.0},
+    ]
+
+    def plan(self, lyric_lines: list, emotion_vector: 'EmotionVector') -> MelodyPlan:
+        """
+        将歌词行列表转换为旋律规划
+
+        Args:
+            lyric_lines: [(section, text), ...] 如 [('verse1', '你不是没回'), ('turning', '只是没想回')]
+            emotion_vector: EmotionVector 实例
+
+        Returns:
+            MelodyPlan: {
+                "key": "A_minor",
+                "bpm": 70,
+                "notes": [Note(...), ...]
+            }
+        """
+        primary, intensity = emotion_vector.get_primary()
+
+        # 1. 选择调式和 BPM
+        key = self.KEY_MAP.get(primary, self.KEY_MAP["default"])
+        bpm = self.BPM_MAP.get(primary, self.BPM_MAP["default"])
+
+        # 2. 获取音阶
+        scale = self.SCALES.get(key, self.SCALES["C_major"])
+
+        notes = []
+        for section, text in lyric_lines:
+            # Hook 句使用重复型 melody（更有记忆点）
+            if section == "turning" or "hook" in section:
+                section_notes = self._generate_hook_melody(text, scale)
+            else:
+                section_notes = self._generate_line_melody(text, scale, section)
+            notes.extend(section_notes)
+
+        return MelodyPlan(key=key, bpm=bpm, notes=notes)
+
+    def _generate_line_melody(self, line: str, scale: list, section: str) -> list:
+        """将一行歌词转换为音符序列"""
+        notes = []
+        for i, char in enumerate(line):
+            # 标点停顿
+            if char in "，。！？":
+                notes.append(Note(pitch="REST", duration=0.5, lyric=char))
+                continue
+            # 跳过空白
+            if char.strip() == "":
+                continue
+
+            # 根据位置选择音高（简单上下行）
+            if i == 0:
+                # 第一字用根音
+                pitch = scale[len(scale) // 2]
+            elif i < len(line) // 2:
+                # 前半段上行
+                idx = min(i, len(scale) - 1)
+                pitch = scale[idx]
+            else:
+                # 后半段下行
+                idx = max(0, len(scale) - 1 - (i - len(line) // 2))
+                idx = min(idx, len(scale) - 1)
+                pitch = scale[idx]
+
+            # 根据是否是句尾拉长音
+            duration = 1.0 if i == len(line) - 1 and section != "verse1" else 0.5
+
+            notes.append(Note(pitch=pitch, duration=duration, lyric=char))
+
+        return notes
+
+    def _generate_hook_melody(self, line: str, scale: list) -> list:
+        """
+        Hook 句使用重复型旋律（制造洗脑感）
+        基于 HOOK_MELODY 模板循环
+        """
+        notes = []
+        hook_idx = 0
+        for i, char in enumerate(line):
+            if char in "，。！？":
+                notes.append(Note(pitch="REST", duration=0.5, lyric=char))
+                continue
+            if char.strip() == "":
+                continue
+
+            # 循环使用 Hook 模板
+            template = self.HOOK_MELODY[hook_idx % len(self.HOOK_MELODY)]
+            pitch = template["pitch"]
+            duration = 0.5  # Hook 句用固定短音，更有节奏感
+
+            notes.append(Note(pitch=pitch, duration=duration, lyric=char))
+            hook_idx += 1
+
+        return notes
+
+    def to_midi_events(self, plan: MelodyPlan) -> list:
+        """
+        将 MelodyPlan 转换为 MIDI 事件列表（供合成器使用）
+
+        Returns:
+            [(time_sec, pitch, duration, lyric), ...]
+        """
+        events = []
+        current_time = 0.0
+        for note in plan.notes:
+            if note.pitch == "REST":
+                current_time += note.duration
+            else:
+                events.append((current_time, note.pitch, note.duration, note.lyric))
+                current_time += note.duration
+        return events
+
+
+# ==================== Audio Layer: TTS + BGM + Composition ====================
+# v9.8: 歌词 → 有声作品（TTS + 背景乐 + 合成）
+
+
+class AudioLayer:
+    """
+    v9.8 Audio Layer - 歌词 → 有声作品
+
+    功能：
+    1. TTS：将歌词转为语音（edge-tts）
+    2. BGM：根据情绪向量选择背景乐
+    3. Composition：合成最终音频
+
+    使用方式：
+        audio = AudioLayer()
+        audio.synthesize(lyric_lines, emotion_vector, output_path="song.mp3")
+    """
+
+    # 情绪 → BGM 文件名映射（需要配合实际BGM资源）
+    BGM_MAP = {
+        "sadness": "sad_piano",
+        "nostalgia": "lofi_regret",
+        "anger": "dark_beat",
+        "loneliness": "empty_room",
+        "regret": "lofi_slow",
+        "hope": "soft_warm",
+        "joy": "upbeat_light",
+    }
+
+    # TTS 角色映射
+    TTS_VOICE_MAP = {
+        "sadness": "zh-CN-XiaoyiNeural",      # 温柔女声
+        "nostalgia": "zh-CN-YunxiNeural",     # 成熟男声
+        "anger": "zh-CN-YunyangNeural",       # 沉稳男声
+        "loneliness": "zh-CN-XiaoyiNeural",   # 温柔女声
+        "regret": "zh-CN-YunxiNeural",         # 成熟男声
+        "hope": "zh-CN-XiaoxiaoNeural",       # 清新女声
+        "default": "zh-CN-XiaoyiNeural",
+    }
+
+    def __init__(self, bgm_dir: str = "assets/bgm"):
+        self.bgm_dir = bgm_dir
+        self.temp_dir = "temp_audio"
+        import os
+        os.makedirs(self.temp_dir, exist_ok=True)
+        os.makedirs(bgm_dir, exist_ok=True)
+
+    def synthesize(
+        self,
+        lyric_lines: list,
+        emotion_vector: 'EmotionVector',
+        output_path: str = "output/song.mp3",
+        voice_over_bgm: float = 0.7,
+        bgm_volume: float = 0.3,
+    ) -> dict:
+        """
+        将歌词列表合成为音频文件
+
+        Args:
+            lyric_lines: [(section, text), ...] 如 [('verse1', '我不是没回你'), ('turning', '只是没想回')]
+            emotion_vector: EmotionVector 实例
+            output_path: 输出文件路径
+            voice_over_bgm: 人声音量 (0-1)
+            bgm_volume: BGM 音量 (0-1)
+
+        Returns:
+            dict: {
+                "lyric_lines": 原始歌词,
+                "tts_files": TTS临时文件列表,
+                "bgm_file": 背景乐文件,
+                "final_output": 最终文件路径,
+                "duration_sec": 总时长(秒),
+            }
+        """
+        import os
+        import asyncio
+
+        import os as os_mod
+        os_mod.makedirs(os_mod.path.dirname(output_path) or "output", exist_ok=True)
+
+        # 1. 获取主情绪和TTS音色
+        primary, intensity = emotion_vector.get_primary()
+        voice = self.TTS_VOICE_MAP.get(primary, self.TTS_VOICE_MAP["default"])
+
+        # 2. 收集所有歌词文本（按行）
+        all_text_lines = []
+        for _, text in lyric_lines:
+            if text:
+                all_text_lines.extend(text.split("\n"))
+
+        # 过滤空行
+        all_text_lines = [l.strip() for l in all_text_lines if l.strip()]
+        if not all_text_lines:
+            return {"error": "No lyric lines to synthesize"}
+
+        # 3. 为每句歌词生成TTS
+        tts_files = []
+        for i, line_text in enumerate(all_text_lines):
+            tts_file = os.path.join(self.temp_dir, f"tts_{i:03d}.mp3")
+            tts_files.append(tts_file)
+            asyncio.run(self._tts_async(line_text, tts_file, voice))
+
+        # 4. 选择BGM
+        bgm_key = self.BGM_MAP.get(primary, self.BGM_MAP["sadness"])
+        bgm_file = os.path.join(self.bgm_dir, f"{bgm_key}.mp3")
+
+        # 5. 合成最终音频
+        if all(os.path.exists(f) for f in tts_files) and os.path.exists(bgm_file):
+            final_output = self._compose_audio(tts_files, bgm_file, output_path, voice_over_bgm, bgm_volume)
+            total_duration = len(tts_files) * 3.5  # 估算每句3.5秒
+            return {
+                "lyric_lines": lyric_lines,
+                "tts_files": tts_files,
+                "bgm_file": bgm_file,
+                "final_output": final_output,
+                "duration_sec": total_duration,
+                "primary_emotion": primary,
+                "voice": voice,
+            }
+        else:
+            # TTS成功但BGM不存在时，只返回TTS文件列表
+            return {
+                "lyric_lines": lyric_lines,
+                "tts_files": tts_files,
+                "bgm_file": None,
+                "final_output": None,
+                "duration_sec": len(tts_files) * 3.5,
+                "primary_emotion": primary,
+                "voice": voice,
+                "note": "BGM not found, TTS generated successfully",
+            }
+
+    async def _tts_async(self, text: str, output_path: str, voice: str):
+        """异步生成TTS"""
+        try:
+            import edge_tts
+            communicate = edge_tts.Communicate(text, voice=voice)
+            await communicate.save(output_path)
+        except Exception as e:
+            import warnings
+            warnings.warn(f"TTS generation failed for '{text}': {e}")
+
+    def _compose_audio(
+        self,
+        tts_files: list,
+        bgm_file: str,
+        output_path: str,
+        voice_vol: float,
+        bgm_vol: float,
+    ) -> str:
+        """使用 moviepy 合成多轨音频"""
+        try:
+            from moviepy.editor import (
+                AudioFileClip, CompositeAudioClip,
+                concatenate_audioclips
+            )
+        except ImportError:
+            return None
+
+        # TTS 文件按顺序拼接
+        tts_clips = []
+        for f in tts_files:
+            if os.path.exists(f):
+                clip = AudioFileClip(f)
+                tts_clips.append(clip)
+
+        if not tts_clips:
+            return None
+
+        voice_track = concatenate_audioclips(tts_clips).volumex(voice_vol)
+
+        # BGM
+        bgm_track = AudioFileClip(bgm_file)
+        # BGM 循环到与语音同长度
+        bgm_loop = bgm_track.loop(duration=voice_track.duration)
+        bgm_track_final = bgm_loop.volumex(bgm_vol)
+
+        # 混音
+        final = CompositeAudioClip([bgm_track_final, voice_track])
+        final.write_audiofile(output_path, fps=44100)
+        return output_path
+
+    def synthesize_verse(
+        self,
+        verse_lines: list,
+        emotion_vector: 'EmotionVector',
+        output_path: str,
+    ) -> str:
+        """
+        简化版：合成单个段落（如Hook句单独使用）
+        用于快速生成一句可听的内容
+        """
+        import os
+        import asyncio
+        from shutil import copy
+
+        primary, _ = emotion_vector.get_primary()
+        voice = self.TTS_VOICE_MAP.get(primary, self.TTS_VOICE_MAP["default"])
+
+        # 单句直接合成
+        text = " ".join([l for _, l in verse_lines if l])
+        if not text.strip():
+            return None
+
+        tts_file = os.path.join(self.temp_dir, "hook_tts.mp3")
+        try:
+            import edge_tts
+            asyncio.run(self._tts_async(text, tts_file, voice))
+            if os.path.exists(tts_file):
+                os.makedirs(os.path.dirname(output_path) or "output", exist_ok=True)
+                copy(tts_file, output_path)
+                return output_path
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Verse TTS failed: {e}")
+        return None
