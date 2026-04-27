@@ -18,7 +18,8 @@
       "Bash(python -c \"from agent_os import EnhancedAgentOS, ArtPipeline, EmotionVector, LyricRhythmSpec, ChatCompressionLayer; print\\('Import OK'\\)\")",
       "Bash(python:*)",
       "Bash(find D:/wechat_to_lyric_agent -name \"*.pyc\" -delete)",
-      "Bash(find D:/wechat_to_lyric_agent -name \"__pycache__\" -type d -exec rm -rf {} +)"
+      "Bash(find D:/wechat_to_lyric_agent -name \"__pycache__\" -type d -exec rm -rf {} +)",
+      "Bash(iconv -f utf-8 -t utf-8)"
     ]
   }
 }

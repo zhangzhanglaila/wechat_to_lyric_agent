@@ -1459,6 +1459,91 @@ class HumanRewriteLayer:
 
         return line
 
+    # ==================== v11.1 人类噪声注入 ====================
+    # 破坏对称性：让AI歌词不像AI写的
+    # 核心原则：人类说话不完整、有自我否定、会截断
+
+    # 截断模式（说一半不说了）
+    TRUNCATION_PATTERNS = [
+        lambda x: "算了 " + x,
+        lambda x: "不说了 " + x,
+        lambda x: "算了不 " + x.lstrip("不没") if x.startswith(("不", "没")) else x,
+    ]
+
+    # 自我否定（刚说完就反悔）
+    SELF_DENIAL_PATTERNS = [
+        lambda x: x + "……吧",  # 轻微怀疑
+        lambda x: x + "啊",     # 口语化收尾
+        lambda x: "你是不是 " + x.lstrip("你是不是"),  # 反问质疑
+        lambda x: x + "……算了",  # 说完收回
+    ]
+
+    # 不完整句（句尾消失）
+    INCOMPLETE_PATTERNS = [
+        lambda x: x + "……",
+        lambda x: x + "…",
+        lambda x: x.rstrip("，。") + "…",  # 去掉标点加省略号
+    ]
+
+    # 破坏对称性（不对称才是人）
+    ASYMMETRY_PATTERNS = [
+        lambda x: x[:len(x)//2] if len(x) > 4 else x,  # 截断前半
+        lambda x: x.replace(x[len(x)//2:len(x)//2+1], ""),  # 漏字
+        lambda x: x + "也 " + x[-2:] if len(x) > 3 else x,  # 重复尾巴
+    ]
+
+    def inject_human_noise(self, line: str, intensity: float = 0.3) -> str:
+        """
+        v11.1 人类噪声注入 - 破坏对称性
+
+        核心：不像 AI 写的 = 不完整 + 有自我否定 + 不工整
+
+        Patterns（按优先级）：
+        1. 截断（说一半不说了）
+        2. 自我否定（刚说完就反悔）
+        3. 不完整句（句尾消失）
+        4. 破坏对称（不对称才是人）
+
+        Args:
+            line: 原始歌词行
+            intensity: 触发概率（0.0-1.0）
+
+        Returns:
+            注入人类噪声后的行
+        """
+        import random
+
+        if intensity <= 0 or len(line.strip()) < 3:
+            return line
+
+        # 避开 Hook 行（Hook 必须工整有力量）
+        if "【Hook】" in line or "！" in line or HOOK_PREFIX in line:
+            return line
+
+        clean = line.strip()
+        if len(clean) < 3:
+            return line
+
+        roll = random.random()
+        if roll < intensity * 0.4:
+            # 截断：说一半不说了
+            pattern = random.choice(self.TRUNCATION_PATTERNS)
+            return pattern(clean)
+        elif roll < intensity * 0.7:
+            # 自我否定：刚说完就反悔
+            pattern = random.choice(self.SELF_DENIAL_PATTERNS)
+            return pattern(clean)
+        elif roll < intensity * 0.85:
+            # 不完整句：句尾消失
+            pattern = random.choice(self.INCOMPLETE_PATTERNS)
+            return pattern(clean)
+        elif roll < intensity:
+            # 破坏对称：不对称才是人
+            pattern = random.choice(self.ASYMMETRY_PATTERNS)
+            return pattern(clean)
+
+        return line
+
     # ==================== v9.0 语义驱动 Rewrite ====================
 
     # 自我矛盾模板库（情绪峰值触发）
@@ -1638,6 +1723,9 @@ class HumanRewriteLayer:
         # 4. 轻微卡顿（v9.1: 情绪轨迹斜率）
         if ctx.should_use_repetition(emotion_weight):
             line = self._apply_imperfect_repetition_v9(line, ctx)
+
+        # v11.1: 人类噪声注入 - 破坏对称性（让歌词不像AI写的）
+        line = self.inject_human_noise(line, intensity=profile_strength * 0.3)
 
         # 5. 兜底：概率驱动的人格噪声（原有逻辑）
         if random.random() < profile_strength * 0.3:
@@ -3763,8 +3851,14 @@ class PerformancePlanner:
             # 6. 音高曲线（连音滑向下一个音）
             pitch_curve = self._build_pitch_curve(note, melody_plan.notes, i)
 
+            # v11.1: 情绪音高扰动（sadness 时 f0 微降，制造"压抑感"）
+            adjusted_pitch = note.pitch
+            if primary in ("sadness", "loneliness", "regret"):
+                f0_perturb = random.uniform(5, 15)
+                adjusted_pitch = self._perturb_pitch(note.pitch, -f0_perturb)
+
             performance_notes.append(PerformanceNote(
-                pitch=note.pitch,
+                pitch=adjusted_pitch,
                 duration=note.duration,
                 lyric=note.lyric,
                 pitch_curve=pitch_curve,
@@ -3773,6 +3867,9 @@ class PerformancePlanner:
                 stress=note_stress,
                 attack=note_attack,
             ))
+
+        # v11.1: 句尾拖音 + 停顿注入（让唱歌不像念稿）
+        performance_notes = self._apply_drag_and_pause(performance_notes)
 
         # 时序人类化
         performance_notes = self._humanize_timing(performance_notes, intensity)
@@ -3802,6 +3899,101 @@ class PerformancePlanner:
 
         # 单音：轻微波动模拟人声
         return [(0.0, note.pitch), (note.duration, note.pitch)]
+
+    def _perturb_pitch(self, pitch: str, hz_delta: float) -> str:
+        """
+        v11.1 将音高按 Hz 微调（用于情绪扰动）
+
+        sadness 时 f0 -= 5~15 Hz（压抑感）
+        """
+        pitch_freq = {
+            "C4": 261.63, "D4": 293.66, "E4": 329.63, "F4": 349.23,
+            "G4": 392.00, "A4": 440.00, "B4": 493.88,
+            "C5": 523.25, "D5": 587.33, "E5": 659.25, "F5": 698.46,
+            "G5": 783.99, "A5": 880.00, "B5": 987.77,
+        }
+        if pitch not in pitch_freq:
+            return pitch
+
+        new_freq = pitch_freq[pitch] + hz_delta
+        # 找最近的音高
+        closest = min(pitch_freq.items(), key=lambda x: abs(x[1] - new_freq))
+        return closest[0]
+
+    def _apply_drag_and_pause(self, notes: list) -> list:
+        """
+        v11.1 句尾拖音 + 停顿注入
+
+        规则：
+        1. 句尾音符延长 1.3~1.5 倍（拖音/滑音）
+        2. 30% 概率插入停顿（不说话时）
+        3. 段落末尾的 Hook 音延长更多
+        """
+        import random
+
+        if not notes:
+            return notes
+
+        result = []
+        for i, note in enumerate(notes):
+            result.append(note)
+
+            # 判断是否是句尾或段落末
+            is_line_end = self._is_line_end(i, notes)
+            is_hook_end = self._is_hook_end(i, notes)
+
+            if note.pitch == "REST":
+                # 30% 概率插入额外停顿
+                if random.random() < 0.3 and is_line_end:
+                    result.append(PerformanceNote(
+                        pitch="REST", duration=random.uniform(0.3, 0.6),
+                        lyric="", vibrato=0, breathiness=0, stress=0, attack=0
+                    ))
+                continue
+
+            if is_line_end:
+                # 句尾拖音：延长 1.3~1.5 倍
+                drag_factor = random.uniform(1.3, 1.5)
+                result[-1] = PerformanceNote(
+                    pitch=note.pitch,
+                    duration=note.duration * drag_factor,
+                    lyric=note.lyric,
+                    pitch_curve=note.pitch_curve,
+                    vibrato=note.vibrato,
+                    breathiness=note.breathiness,
+                    stress=note.stress,
+                    attack=note.attack,
+                )
+            elif is_hook_end:
+                # Hook 句尾延长更多
+                drag_factor = random.uniform(1.5, 1.8)
+                result[-1] = PerformanceNote(
+                    pitch=note.pitch,
+                    duration=note.duration * drag_factor,
+                    lyric=note.lyric,
+                    pitch_curve=note.pitch_curve,
+                    vibrato=note.vibrato,
+                    breathiness=note.breathiness,
+                    stress=note.stress,
+                    attack=note.attack,
+                )
+
+        return result
+
+    def _is_line_end(self, index: int, notes: list) -> bool:
+        """判断是否是句尾（下一个是 REST 或 最后）"""
+        if index >= len(notes) - 1:
+            return True
+        return notes[index + 1].pitch == "REST"
+
+    def _is_hook_end(self, index: int, notes: list) -> bool:
+        """判断是否是 Hook 乐句末尾"""
+        if not (index % 8 >= 4):  # Hook 位置在前半拍
+            return False
+        if index >= len(notes) - 1:
+            return True
+        # Hook 乐句通常在中间，检查是否是 8 音符周期的末尾
+        return (index + 1) % 8 == 7 or notes[index + 1].pitch == "REST"
 
     def _humanize_timing(self, notes: list, intensity: float) -> list:
         """
@@ -3984,7 +4176,91 @@ class MelodyPlanner:
                 rhythm_pattern_idx = (rhythm_pattern_idx + 1) % len(self.RHYTHM_PATTERNS)
             notes.extend(section_notes)
 
+        # v11.2: Hook 句重复 + 微变化（制造记忆点）
+        notes = self._apply_hook_repetition_with_variation(notes)
+
         return MelodyPlan(key=key, bpm=bpm, notes=notes)
+
+    def _apply_hook_repetition_with_variation(self, notes: list) -> list:
+        """
+        v11.2 Hook 重复 + 微变化
+
+        规则：Hook 句重复一次，但最后一个音变化
+        例：
+          原句：已读不回 我懂了  (pitch: C E G E C G)
+          重复：已读不回 我懂了  (pitch: C E G E C A)  ← 最后一音变了
+
+        为什么：人类唱歌时重复会有微小变化，不会100%相同
+        """
+        import random
+
+        if not notes:
+            return notes
+
+        # 找 Hook 乐句（8音符后的那个段落）
+        hook_start = len(notes) // 2 if len(notes) > 8 else -1
+
+        if hook_start < 4:
+            return notes  # 音符太少不做处理
+
+        # 找到 Hook 乐句的起始位置（跳过 REST 找实际音符）
+        hook_idx = hook_start
+        while hook_idx < len(notes) and notes[hook_idx].pitch == "REST":
+            hook_idx += 1
+
+        # 取 Hook 乐句的非REST音符（4-8个）
+        hook_notes = []
+        for n in notes[hook_idx:hook_idx+12]:
+            if n.pitch != "REST":
+                hook_notes.append(n)
+            if len(hook_notes) >= 8:
+                break
+
+        if len(hook_notes) < 4:
+            return notes  # 实际音符太少不做处理
+
+        # 构建重复乐句（最后一个音变化）
+        repeated = []
+        for i, note in enumerate(hook_notes):
+            if i == len(hook_notes) - 1:
+                # 最后一音：向上小三度或向下大二度
+                last_note = hook_notes[-1]
+                variation = random.choice(["+m3", "-M2"])
+                new_pitch = self._shift_pitch(last_note.pitch, variation)
+                repeated.append(Note(pitch=new_pitch, duration=note.duration, lyric=note.lyric))
+            else:
+                repeated.append(Note(pitch=note.pitch, duration=note.duration, lyric=note.lyric))
+
+        # 在 Hook 乐句后追加重复乐句
+        result = notes + [Note(pitch="REST", duration=0.5, lyric="")] + repeated
+        return result
+
+    def _shift_pitch(self, pitch: str, direction: str) -> str:
+        """将音高偏移半音数"""
+        pitch_freq = {
+            "C4": 261.63, "D4": 293.66, "E4": 329.63, "F4": 349.23,
+            "G4": 392.00, "A4": 440.00, "B4": 493.88,
+            "C5": 523.25, "D5": 587.33, "E5": 659.25, "F5": 698.46,
+            "G5": 783.99, "A5": 880.00, "B5": 987.77,
+        }
+        if pitch not in pitch_freq:
+            return pitch
+
+        semitone_map = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+        note = pitch[:-1]
+        octave = int(pitch[-1])
+        semitone = semitone_map[note[0]]
+
+        if direction == "+m3":
+            semitone += 3  # 向上小三度
+        elif direction == "-M2":
+            semitone -= 2  # 向下大二度
+
+        new_octave = octave + semitone // 12
+        new_semitone = semitone % 12
+        note_names = ["C", "D", "E", "F", "G", "A", "B"]
+        new_note = note_names[new_semitone % 7]
+        return f"{new_note}{new_octave}"
 
     def _generate_line_melody(
         self, line: str, scale: list, chord_tones: list, section: str, pattern_idx: int
@@ -4543,9 +4819,18 @@ class DiffSingerAdapter:
                 all_stress.append(note.stress)
                 all_attack.append(note.attack)
 
-                # 音高曲线
-                pitch_hz = self._pitch_to_hz(note.pitch)
-                all_f0.append((time_offset, pitch_hz))
+                # v11.3: 音高曲线 + 颤音调制
+                # 颤音：在基频上叠加 sin_wave(amplitude=5*vibrato, freq=6Hz)
+                base_pitch_hz = self._pitch_to_hz(note.pitch)
+                if note.vibrato > 0.1:
+                    # 生成细粒度 f0 曲线（每50ms一个点）
+                    f0_curve = self._build_vibrato_f0_curve(
+                        base_pitch_hz, note.vibrato, note.duration
+                    )
+                    for t, f in f0_curve:
+                        all_f0.append((time_offset + t, f))
+                else:
+                    all_f0.append((time_offset, base_pitch_hz))
                 time_offset += phoneme_dur
 
         return {
@@ -4569,6 +4854,42 @@ class DiffSingerAdapter:
             "G5": 783.99, "A5": 880.00, "B5": 987.77,
         }
         return pitch_freq.get(pitch, 440.0)
+
+    def _build_vibrato_f0_curve(self, base_hz: float, vibrato: float, duration: float) -> list:
+        """
+        v11.3 构建带颤音的 f0 曲线
+
+        规则：
+        - 颤音幅度 = 5 * vibrato Hz（在基频上下波动）
+        - 颤音频率 = 6 Hz（每秒6个周期）
+        - 只在音符时长 > 0.3s 时应用
+
+        Args:
+            base_hz: 基频
+            vibrato: 0.0-1.0 颤音强度
+            duration: 音符时长（秒）
+
+        Returns:
+            [(time, f0_hz), ...] 时间从0开始
+        """
+        import math
+
+        if duration < 0.3 or vibrato < 0.1:
+            return [(0.0, base_hz)]
+
+        amplitude = 5.0 * vibrato  # 最大 ±5*vibrato Hz
+        freq = 6.0  # 6 Hz per second
+
+        points = []
+        t = 0.0
+        step = 0.05  # 50ms per point
+        while t < duration:
+            # sin_wave: amplitude * sin(2π * freq * t)
+            delta = amplitude * math.sin(2 * math.pi * freq * t)
+            points.append((t, base_hz + delta))
+            t += step
+
+        return points
 
 
 # ==================== DiffSinger Runner ====================
