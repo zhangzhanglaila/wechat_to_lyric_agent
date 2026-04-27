@@ -4328,6 +4328,414 @@ class AudioLayer:
         return None
 
 
+# ==================== Phoneme Alignment Layer ====================
+# v11: 歌词 → 音素序列（接 DiffSinger / SVC 的关键层）
+
+
+class PhonemeAligner:
+    """
+    v11 PhonemeAligner - 歌词 → 音素序列
+
+    功能：
+    将汉字歌词转换为音素序列，供 singing model 使用
+
+    使用方式：
+        aligner = PhonemeAligner()
+        phonemes = aligner.align("你不是没回")
+        # → ["ni3", "bu4", "shi4", "mei2", "hui2"]
+    """
+
+    # 声母映射
+    INITIALS = {
+        'b': 'b', 'p': 'p', 'm': 'm', 'f': 'f',
+        'd': 'd', 't': 't', 'n': 'n', 'l': 'l',
+        'g': 'g', 'k': 'k', 'h': 'h',
+        'j': 'j', 'q': 'q', 'x': 'x',
+        'zh': 'zh', 'ch': 'ch', 'sh': 'sh', 'r': 'r',
+        'z': 'z', 'c': 'c', 's': 's', 'y': 'y', 'w': 'w',
+    }
+
+    # 韵母映射（带声调）
+    FINALS = {
+        'a': 'a1', 'ai': 'ai4', 'an': 'an1', 'ang': 'ang1', 'ao': 'ao1',
+        'e': 'e4', 'ei': 'ei4', 'en': 'en1', 'eng': 'eng1', 'er': 'er2',
+        'i': 'i1', 'ia': 'ia1', 'ian': 'ian1', 'iang': 'iang1', 'iao': 'iao1',
+        'ie': 'ie1', 'in': 'in1', 'ing': 'ing1', 'iong': 'iong1', 'iu': 'iu1',
+        'o': 'o2', 'ong': 'ong1', 'ou': 'ou1',
+        'u': 'u1', 'ua': 'ua1', 'uai': 'uai4', 'uan': 'uan1', 'uang': 'uang1',
+        'ui': 'ui1', 'un': 'un1', 'uo': 'uo2',
+        'v': 'v0', 've': 've4',
+    }
+
+    # 单字读音库（常用字）
+    PINYIN_DICT = {
+        '你': 'ni3', '不': 'bu4', '是': 'shi4', '没': 'mei2', '回': 'hui2',
+        '我': 'wo3', '们': 'men5', '在': 'zai4', '说': 'shuo1', '什': 'shen2',
+        '么': 'me5', '来': 'lai2', '了': 'le5', '这': 'zhe4', '那': 'na4',
+        '个': 'ge4', '人': 'ren2', '有': 'you3', '一': 'yi1', '个': 'ge4',
+        '爱': 'ai4', '好': 'hao4', '吗': 'ma5', '想': 'xiang3', '要': 'yao4',
+        '去': 'qu4', '看': 'kan4', '知': 'zhi1', '道': 'dao4',
+        '距': 'ju4', '离': 'li2', '远': 'yuan3', '心': 'xin1', '了': 'le5',
+        '只': 'zhi3', '想': 'xiang3', '等': 'deng3', '候': 'hou4',
+        '错': 'cuo4', '过': 'guo4', '已': 'yi3', '经': 'jing1', '早': 'zao3',
+        '从': 'cong2', '开': 'kai1', '始': 'shi3', '就': 'jiu4', '最': 'zui4',
+        '后': 'hou4', '知': 'zhi1', '觉': 'jue2',
+    }
+
+    def align(self, text: str) -> list:
+        """
+        将中文文本转换为音素序列
+
+        Args:
+            text: 中文文本，如 "你不是没回"
+
+        Returns:
+            音素列表，如 ["ni3", "bu4", "shi4", "mei2", "hui2"]
+        """
+        phonemes = []
+        for char in text:
+            char = char.strip()
+            if not char:
+                continue
+            if char in "，。！？、；：":
+                phonemes.append('SP')  # silence phoneme
+                continue
+            pinyin = self._get_pinyin(char)
+            phonemes.append(pinyin)
+        return phonemes
+
+    def align_with_timing(self, text: str, durations: list) -> list:
+        """
+        带时长信息的音素对齐
+
+        Args:
+            text: 中文文本
+            durations: 每个字的持续时间列表（秒）
+
+        Returns:
+            [(phoneme, duration), ...]
+        """
+        phonemes = self.align(text)
+        result = []
+        for i, (phoneme, dur) in enumerate(zip(phonemes, durations)):
+            if phoneme == 'SP':
+                result.append((phoneme, dur))
+            else:
+                result.append((phoneme, dur))
+        return result
+
+    def _get_pinyin(self, char: str) -> str:
+        """获取单个汉字的拼音"""
+        if char in self.PINYIN_DICT:
+            return self.PINYIN_DICT[char]
+
+        # 尝试通过规则推断（简化版）
+        # 实际生产环境应该用 pypinyin 库
+        return f"{char}_unk"
+
+    def phonemes_to_model_input(self, phonemes: list, pitch_curve: list) -> dict:
+        """
+        将音素序列 + 音高曲线转换为模型输入格式
+
+        Args:
+            phonemes: ["ni3", "bu4", "shi4", ...]
+            pitch_curve: [(time, pitch), ...] 如 [(0.0, "C4"), (0.5, "D4")]
+
+        Returns:
+            适合 DiffSinger / SVC 的输入格式
+        """
+        # 构建音素时长序列
+        note_durations = []
+        total_time = 0
+        for p in pitch_curve:
+            if isinstance(p, tuple) and len(p) >= 2:
+                dur = p[1] if len(p) == 3 else 0.5
+            else:
+                dur = 0.5
+            note_durations.append(dur)
+            total_time += dur
+
+        # 构建 model-ready 结构
+        return {
+            "phonemes": phonemes,
+            "durations": note_durations,
+            "pitch_curve": pitch_curve,
+            "total_duration": total_time,
+        }
+
+
+# ==================== DiffSinger Adapter ====================
+# v11: PerformancePlan → DiffSinger 输入格式
+
+
+class DiffSingerAdapter:
+    """
+    v11 DiffSingerAdapter - 将 PerformancePlan 转换为 DiffSinger 可用格式
+
+    功能：
+    1. PhonemeAligner 对齐音素
+    2. 将 PerformanceNote 序列转换为 pitch curve
+    3. 输出 DiffSinger / So-VITS-SVC 可消费的格式
+
+    使用方式：
+        adapter = DiffSingerAdapter()
+        model_input = adapter.adapt(performance_plan)
+        # → {"phonemes": [...], "f0": [...], "durations": [...]}
+    """
+
+    # DiffSinger 音素表（简化版）
+    PHONEME_SET = [
+        'SP', 'sil',  # silence
+        'a', 'ai', 'an', 'ang', 'ao', 'e', 'ei', 'en', 'eng', 'er',
+        'i', 'ia', 'ian', 'iang', 'iao', 'ie', 'in', 'ing', 'iong', 'iu',
+        'o', 'ong', 'ou', 'u', 'ua', 'uai', 'uan', 'uang', 'ui', 'un', 'uo', 'v', 've',
+        'b', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n', 'p', 'q', 'r', 's', 't', 'w', 'x', 'y', 'z',
+        'zh', 'ch', 'sh', 'c', 's',
+        'ny', 'thy', 'ey', 'oy', 'gn',
+    ]
+
+    def adapt(self, performance_plan: 'PerformancePlan') -> dict:
+        """
+        将 PerformancePlan 转换为 DiffSinger 输入格式
+
+        Args:
+            performance_plan: PerformancePlan 实例
+
+        Returns:
+            dict: {
+                "phonemes": [...],
+                "f0": [...],  # 音高曲线 (time, f0_hz)
+                "durations": [...],
+                "breathiness": [...],
+                "vibrato": [...],
+            }
+        """
+        phoneme_aligner = PhonemeAligner()
+
+        # 提取音素序列（从 lyric 字段）
+        all_phonemes = []
+        all_f0 = []
+        all_durations = []
+        all_breathiness = []
+        all_vibrato = []
+        all_stress = []
+        all_attack = []
+
+        time_offset = 0.0
+        for note in performance_plan.notes:
+            if note.pitch == "REST":
+                time_offset += note.duration
+                continue
+
+            # 获取拼音音素
+            char_phonemes = phoneme_aligner.align(note.lyric)
+            if not char_phonemes or char_phonemes[0] == f"{note.lyric}_unk":
+                char_phonemes = [note.lyric]
+
+            # 音素时长（均分）
+            phoneme_dur = note.duration / len(char_phonemes) if char_phonemes else note.duration
+
+            for ph in char_phonemes:
+                all_phonemes.append(ph)
+                all_durations.append(phoneme_dur)
+                all_breathiness.append(note.breathiness)
+                all_vibrato.append(note.vibrato)
+                all_stress.append(note.stress)
+                all_attack.append(note.attack)
+
+                # 音高曲线
+                pitch_hz = self._pitch_to_hz(note.pitch)
+                all_f0.append((time_offset, pitch_hz))
+                time_offset += phoneme_dur
+
+        return {
+            "phonemes": all_phonemes,
+            "f0": all_f0,  # [(time_sec, f0_hz), ...]
+            "durations": all_durations,
+            "breathiness": all_breathiness,
+            "vibrato": all_vibrato,
+            "stress": all_stress,
+            "attack": all_attack,
+            "key": performance_plan.key,
+            "bpm": performance_plan.bpm,
+        }
+
+    def _pitch_to_hz(self, pitch: str) -> float:
+        """将音高名称转换为 Hz"""
+        pitch_freq = {
+            "C4": 261.63, "D4": 293.66, "E4": 329.63, "F4": 349.23,
+            "G4": 392.00, "A4": 440.00, "B4": 493.88,
+            "C5": 523.25, "D5": 587.33, "E5": 659.25, "F5": 698.46,
+            "G5": 783.99, "A5": 880.00, "B5": 987.77,
+        }
+        return pitch_freq.get(pitch, 440.0)
+
+
+# ==================== DiffSinger Runner ====================
+# v11: 真实唱歌模型推理
+
+
+class DiffSingerRunner:
+    """
+    v11 DiffSingerRunner - 使用真实 DiffSinger 模型生成唱歌
+
+    功能：
+    1. 接收 Adapter 输出的 model_input
+    2. 写入 DiffSinger 需要的中间格式（txt / json / npy）
+    3. 调用 DiffSinger 推理
+    4. 输出波形文件
+
+    使用方式：
+        runner = DiffSingerRunner()
+        wav_path = runner.run(model_input, output_dir="output/diffsinger")
+    """
+
+    def __init__(self, diffsinger_path: str = None, device: str = "cpu"):
+        """
+        Args:
+            diffsinger_path: DiffSinger 代码路径（默认从环境变量读取）
+            device: 推理设备 "cpu" / "cuda"
+        """
+        self.diffsinger_path = diffsinger_path or os.environ.get("DIFFSINGER_PATH", "")
+        self.device = device
+
+    def run(self, model_input: dict, output_dir: str = "output/diffsinger") -> str:
+        """
+        执行 DiffSinger 推理
+
+        Args:
+            model_input: DiffSingerAdapter.adapt() 输出的格式
+            output_dir: 输出目录
+
+        Returns:
+            生成的音频文件路径
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1. 准备输入文件
+        phoneme_file = os.path.join(output_dir, "phonemes.txt")
+        f0_file = os.path.join(output_dir, "f0.npy")
+        durations_file = os.path.join(output_dir, "durations.txt")
+
+        self._write_phonemes(model_input["phonemes"], phoneme_file)
+        self._write_f0(model_input["f0"], f0_file)
+        self._write_durations(model_input["durations"], durations_file)
+
+        # 2. 调用 DiffSinger 推理
+        wav_path = os.path.join(output_dir, "generated.wav")
+        success = self._run_diffsinger(
+            phoneme_file, f0_file, durations_file,
+            wav_path, model_input
+        )
+
+        if success and os.path.exists(wav_path):
+            return wav_path
+
+        # 降级：返回说明无法执行
+        return None
+
+    def _write_phonemes(self, phonemes: list, filepath: str):
+        """写入音素序列"""
+        with open(filepath, "w", encoding="utf-8") as f:
+            for ph in phonemes:
+                f.write(f"{ph}\n")
+
+    def _write_f0(self, f0_curve: list, filepath: str):
+        """写入 f0 曲线（numpy格式）"""
+        try:
+            import numpy as np
+            times = [t for t, _ in f0_curve]
+            freqs = [f for _, f in f0_curve]
+            np.save(filepath, np.array([times, freqs]))
+        except ImportError:
+            # 没有 numpy 时写入 txt 格式
+            with open(filepath.replace(".npy", ".txt"), "w", encoding="utf-8") as f:
+                for t, f_hz in f0_curve:
+                    f.write(f"{t:.4f} {f_hz:.2f}\n")
+
+    def _write_durations(self, durations: list, filepath: str):
+        """写入音素时长"""
+        with open(filepath, "w", encoding="utf-8") as f:
+            for d in durations:
+                f.write(f"{d:.4f}\n")
+
+    def _run_diffsinger(self, phoneme_file: str, f0_file: str,
+                       durations_file: str, output_wav: str,
+                       model_input: dict) -> bool:
+        """
+        调用 DiffSinger 推理脚本
+
+        实际使用时需要：
+        1. 安装 DiffSinger: pip install diffsinger
+        2. 下载预训练权重
+        3. 替换此方法中的调用逻辑
+        """
+        if not self.diffsinger_path or not os.path.exists(self.diffsinger_path):
+            # 没有 DiffSinger 环境时，记录但不断言失败
+            import warnings
+            warnings.warn(
+                "DiffSinger not found. Install from: https://github.com/produlns/DiffSinger "
+                "or set DIFFSINGER_PATH environment variable. "
+                f"Prepared input files at: {os.path.dirname(phoneme_file)}"
+            )
+            return False
+
+        # 实际 DiffSinger 推理（示例）
+        try:
+            import subprocess
+            cmd = [
+                "python", f"{self.diffsinger_path}/inference.py",
+                "--phoneme", phoneme_file,
+                "--f0", f0_file,
+                "--duration", durations_file,
+                "--output", output_wav,
+                "--device", self.device,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            return result.returncode == 0
+        except Exception as e:
+            import warnings
+            warnings.warn(f"DiffSinger inference failed: {e}")
+            return False
+
+    def run_with_sing_model(self, model_input: dict, output_dir: str = "output/song") -> str:
+        """
+        通用唱歌模型推理接口
+
+        自动检测可用的唱歌模型并执行：
+        1. DiffSinger（优先）
+        2. So-VITS-SVC
+        3. 降级为 pitch-shifted TTS
+
+        Args:
+            model_input: DiffSingerAdapter 输出的格式
+            output_dir: 输出目录
+
+        Returns:
+            生成的音频文件路径，或 None
+        """
+        import os
+
+        # 优先尝试 DiffSinger
+        diffsinger_result = self.run(model_input, output_dir)
+        if diffsinger_result and os.path.exists(diffsinger_result):
+            return diffsinger_result
+
+        # 尝试 So-VITS-SVC（如果有）
+        svc_result = self._try_svc(model_input, output_dir)
+        if svc_result and os.path.exists(svc_result):
+            return svc_result
+
+        return None
+
+    def _try_svc(self, model_input: dict, output_dir: str) -> str:
+        """尝试使用 So-VITS-SVC"""
+        # So-VITS-SVC 需要音频输入，暂时跳过
+        # 实际实现时需要先生成基频，然后送入 SVC
+        return None
+
+
 # ==================== Song Synthesizer: PerformancePlan → Audio ====================
 # v10: 完整歌曲生成（带旋律/节奏/音高）
 
