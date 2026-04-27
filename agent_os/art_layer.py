@@ -3596,6 +3596,23 @@ class Note:
 
 
 @dataclass
+class PerformanceNote(Note):
+    """
+    Performance IR - 带表现力的音符
+    v10: 在 Note 基础上增加人声表现力细节
+
+    区别于 Note：
+    - Note: 离散的"该唱什么"
+    - PerformanceNote: 连续的"怎么唱"
+    """
+    pitch_curve: list = None     # 音高曲线 [(time_offset, pitch), ...]
+    vibrato: float = 0.0        # 颤音强度 0.0-1.0
+    breathiness: float = 0.0    # 气声强度 0.0-1.0
+    stress: float = 0.0         # 力度 0.0-1.0（句首强/句尾弱）
+    attack: float = 0.5        # 起音速度 0.0-1.0（快/慢）
+
+
+@dataclass
 class MelodyPlan:
     """完整旋律规划"""
     key: str         # 调式，如 "C_major", "A_minor"
@@ -3603,30 +3620,285 @@ class MelodyPlan:
     notes: list      # List[Note]
 
 
+@dataclass
+class PerformancePlan:
+    """
+    v10 Performance Plan - 完整表演规划
+    包含音符的表现力参数（气声/颤音/力度/起音）
+    """
+    key: str            # 调式
+    bpm: int            # 节拍
+    emotion: str        # 主情绪（用于 vocal style）
+    notes: list         # List[PerformanceNote]
+
+
+class PerformancePlanner:
+    """
+    v10 PerformancePlanner - 旋律 IR → 表演 IR
+
+    功能：
+    1. 将 MelodyPlan 转换为 PerformancePlan
+    2. 添加人声表现力细节（气声/颤音/力度/起音）
+    3. 时序人类化（±30~80ms 微偏移）
+    4. 情绪 → 声线风格映射（核心差异化）
+
+    这是你系统从"歌词工具"变成"音乐引擎"的关键层
+    """
+
+    # 情绪 → 气声强度映射（气声越多越"倾诉感"）
+    BREATHINESS_MAP = {
+        "sadness": 0.6,
+        "nostalgia": 0.5,
+        "loneliness": 0.7,
+        "regret": 0.5,
+        "anger": 0.2,
+        "joy": 0.2,
+        "warmth": 0.3,
+        "hope": 0.3,
+        "default": 0.4,
+    }
+
+    # 情绪 → 颤音强度映射
+    VIBRATO_MAP = {
+        "sadness": 0.4,
+        "nostalgia": 0.5,
+        "loneliness": 0.3,
+        "regret": 0.4,
+        "anger": 0.2,
+        "joy": 0.2,
+        "warmth": 0.3,
+        "hope": 0.3,
+        "default": 0.3,
+    }
+
+    # 情绪 → 起音速度映射（越慢越"压抑"，越快越"爆发"）
+    ATTACK_MAP = {
+        "sadness": 0.3,    # 慢起音（压抑）
+        "nostalgia": 0.4,
+        "loneliness": 0.3,
+        "regret": 0.4,
+        "anger": 0.8,      # 快起音（爆发）
+        "joy": 0.7,
+        "warmth": 0.6,
+        "hope": 0.6,
+        "default": 0.5,
+    }
+
+    # 情绪 → 力度映射
+    STRESS_MAP = {
+        "sadness": 0.4,
+        "nostalgia": 0.5,
+        "loneliness": 0.4,
+        "regret": 0.4,
+        "anger": 0.8,      # 高力度（爆发）
+        "joy": 0.7,
+        "warmth": 0.6,
+        "hope": 0.6,
+        "default": 0.5,
+    }
+
+    def plan(self, melody_plan: MelodyPlan, emotion_vector: 'EmotionVector') -> PerformancePlan:
+        """
+        将 MelodyPlan 转换为 PerformancePlan（添加表现力）
+
+        Args:
+            melody_plan: MelodyPlanner 输出的旋律规划
+            emotion_vector: 情绪向量
+
+        Returns:
+            PerformancePlan: 包含表演细节的完整规划
+        """
+        import random
+
+        primary, intensity = emotion_vector.get_primary()
+
+        # 获取当前情绪的参数
+        breathiness = self.BREATHINESS_MAP.get(primary, self.BREATHINESS_MAP["default"])
+        vibrato = self.VIBRATO_MAP.get(primary, self.VIBRATO_MAP["default"])
+        attack = self.ATTACK_MAP.get(primary, self.ATTACK_MAP["default"])
+        stress = self.STRESS_MAP.get(primary, self.STRESS_MAP["default"])
+
+        # 强度影响参数微调
+        intensity_factor = 0.5 + intensity * 0.5  # 0.5-1.0
+
+        performance_notes = []
+        for i, note in enumerate(melody_plan.notes):
+            if note.pitch == "REST":
+                performance_notes.append(PerformanceNote(
+                    pitch=note.pitch,
+                    duration=note.duration,
+                    lyric=note.lyric,
+                ))
+                continue
+
+            # 计算表现力参数
+
+            # 1. 句首 → 句尾力度衰减
+            note_stress = stress * intensity_factor
+            if i > 0:
+                # 越靠后力度越低（句尾衰减）
+                note_stress = max(0.2, note_stress - (i * 0.02))
+
+            # 2. 起音速度：句首快/句尾慢
+            note_attack = attack
+            if i > 2:
+                note_attack = max(0.2, note_attack - (i * 0.015))
+
+            # 3. Hook/副歌位置用更高力度
+            is_hook_position = (i % 8 < 4)  # 前半拍强
+            if is_hook_position:
+                note_stress = min(1.0, note_stress * 1.2)
+                note_attack = min(1.0, note_attack * 1.1)
+
+            # 4. 颤音：情绪强时更多
+            note_vibrato = vibrato
+            if intensity > 0.6:
+                note_vibrato = min(0.8, vibrato * 1.3)
+
+            # 5. 气声：sadness/loneliness 用更多
+            note_breathiness = breathiness
+            if primary in ("sadness", "loneliness"):
+                note_breathiness = min(0.9, breathiness * 1.2)
+
+            # 6. 音高曲线（连音滑向下一个音）
+            pitch_curve = self._build_pitch_curve(note, melody_plan.notes, i)
+
+            performance_notes.append(PerformanceNote(
+                pitch=note.pitch,
+                duration=note.duration,
+                lyric=note.lyric,
+                pitch_curve=pitch_curve,
+                vibrato=note_vibrato,
+                breathiness=note_breathiness,
+                stress=note_stress,
+                attack=note_attack,
+            ))
+
+        # 时序人类化
+        performance_notes = self._humanize_timing(performance_notes, intensity)
+
+        return PerformancePlan(
+            key=melody_plan.key,
+            bpm=melody_plan.bpm,
+            emotion=primary,
+            notes=performance_notes,
+        )
+
+    def _build_pitch_curve(self, note: Note, all_notes: list, index: int) -> list:
+        """
+        构建音高曲线（连音滑向下一个音）
+
+        简单实现：从当前音高开始，微小波动
+        """
+        if note.pitch == "REST":
+            return []
+
+        # 检查下一个音是否存在
+        if index + 1 < len(all_notes):
+            next_note = all_notes[index + 1]
+            if next_note.pitch != "REST":
+                # 音高曲线：从当前音滑向下一个音（简化：不变）
+                return [(0.0, note.pitch), (note.duration * 0.8, next_note.pitch)]
+
+        # 单音：轻微波动模拟人声
+        return [(0.0, note.pitch), (note.duration, note.pitch)]
+
+    def _humanize_timing(self, notes: list, intensity: float) -> list:
+        """
+        时序人类化：±30~80ms 微偏移
+
+        规则：
+        - 随机偏移 ±30~80ms
+        - 句尾延迟 50~100ms
+        - Hook 位置提前 20~50ms
+        """
+        import random
+
+        humanized = []
+        cumulative_offset = 0.0
+
+        for i, note in enumerate(notes):
+            if note.pitch == "REST":
+                cumulative_offset += note.duration
+                humanized.append(note)
+                continue
+
+            # 随机微偏移 ±40ms（0.04秒）
+            offset = random.uniform(-0.04, 0.04) * (0.5 + intensity * 0.5)
+
+            # 句尾延迟 50~100ms
+            is_sentence_end = (i == len(notes) - 1 or all_notes_rest_after(i, notes))
+            if is_sentence_end:
+                offset += random.uniform(0.05, 0.1)
+
+            # Hook 位置提前 20~50ms
+            is_hook_pos = (i % 8 < 4)
+            if is_hook_pos:
+                offset -= random.uniform(0.02, 0.05)
+
+            humanized_note = PerformanceNote(
+                pitch=note.pitch,
+                duration=note.duration,
+                lyric=note.lyric,
+                pitch_curve=note.pitch_curve,
+                vibrato=note.vibrato,
+                breathiness=note.breathiness,
+                stress=note.stress,
+                attack=note.attack,
+            )
+            humanized.append(humanized_note)
+
+        return humanized
+
+
+def all_notes_rest_after(index: int, notes: list) -> bool:
+    """检查某个音符之后是否全是 REST"""
+    for j in range(index + 1, len(notes)):
+        if notes[j].pitch != "REST":
+            return False
+    return True
+
+
+# ==================== Melody Layer: 歌词 → 音符序列 ====================
+# v9.9: MelodyPlanner - 歌词 → Melody IR（中间协议层）
+
+"""
+MelodyPlanner - 歌词 → 旋律 IR
+
+功能：
+1. 将歌词行转换为音符序列（Melody IR）
+2. 情绪 → 调式/BPM 映射（核心差异化）
+3. 是 DiffSinger / So-VITS-SVC 的前置协议层
+
+使用方式：
+    planner = MelodyPlanner()
+    plan = planner.plan([('verse1', '你不是没回'), ('turning', '只是没想回')], emotion_vector)
+    # plan.key → "A_minor"
+    # plan.bpm → 70
+    # plan.notes → [Note(pitch="C4", duration=0.5, lyric="你"), ...]
+"""
+
 class MelodyPlanner:
     """
     v9.9 MelodyPlanner - 歌词 → 旋律 IR
-
-    功能：
-    1. 将歌词行转换为音符序列（Melody IR）
-    2. 情绪 → 调式/BPM 映射（核心差异化）
-    3. 是 DiffSinger / So-VITS-SVC 的前置协议层
-
-    使用方式：
-        planner = MelodyPlanner()
-        plan = planner.plan([('verse1', '你不是没回'), ('turning', '只是没想回')], emotion_vector)
-        # plan.key → "A_minor"
-        # plan.bpm → 70
-        # plan.notes → [Note(pitch="C4", duration=0.5, lyric="你"), ...]
     """
 
-    # 调式音阶（简单版：C大调 / A小调）
+    # 调式音阶
     SCALES = {
         "C_major": ["C4", "D4", "E4", "F4", "G4", "A4", "B4"],
         "G_major": ["G4", "A4", "B4", "C5", "D5", "E5", "F#5"],
         "A_minor": ["A4", "B4", "C5", "D5", "E5", "F5", "G5"],
         "E_minor": ["E4", "F#4", "G4", "A4", "B4", "C5", "D5"],
         "D_minor": ["D4", "E4", "F4", "G4", "A4", "Bb4", "C5"],
+    }
+
+    # 和弦音（锚点音 - 强拍用）
+    CHORD_TONES = {
+        "C_major": ["C4", "E4", "G4"],
+        "G_major": ["G4", "B4", "D5"],
+        "A_minor": ["A4", "C5", "E5"],
+        "E_minor": ["E4", "G4", "B4"],
+        "D_minor": ["D4", "F4", "A4"],
     }
 
     # 情绪 → 调式映射
@@ -3655,14 +3927,20 @@ class MelodyPlanner:
         "default": 85,
     }
 
-    # Hook 句的重复 melody（用于副歌洗脑）
-    HOOK_MELODY = [
-        {"pitch": "C4", "duration": 0.5},
-        {"pitch": "E4", "duration": 0.5},
-        {"pitch": "G4", "duration": 0.5},
-        {"pitch": "E4", "duration": 0.5},
-        {"pitch": "C4", "duration": 1.0},
+    # 节奏模板（不均匀，制造"歌感"而非"念稿感"）
+    RHYTHM_PATTERNS = [
+        [0.5, 0.5, 1.0],         # 短-短-长（最常用）
+        [0.25, 0.25, 0.5, 1.0], # 短短短-长（切分感）
+        [0.5, 1.0, 0.5],         # 短-长-短（起伏）
+        [0.375, 0.375, 0.75],    # 三连音变体
     ]
+
+    # Hook 乐句模板（AABA 结构）
+    # 4字小节为单位：motif A / motif A / motif B / motif A（回归）
+    HOOK_MOTIFS = {
+        "A": [("C4", 0.5), ("E4", 0.5), ("G4", 0.5), ("E4", 0.5)],
+        "B": [("G4", 0.5), ("A4", 0.5), ("B4", 0.5), ("A4", 0.5)],
+    }
 
     def plan(self, lyric_lines: list, emotion_vector: 'EmotionVector') -> MelodyPlan:
         """
@@ -3679,80 +3957,138 @@ class MelodyPlanner:
                 "notes": [Note(...), ...]
             }
         """
+        import random
+
         primary, intensity = emotion_vector.get_primary()
 
         # 1. 选择调式和 BPM
         key = self.KEY_MAP.get(primary, self.KEY_MAP["default"])
         bpm = self.BPM_MAP.get(primary, self.BPM_MAP["default"])
 
-        # 2. 获取音阶
+        # 2. 获取音阶 + 和弦音
         scale = self.SCALES.get(key, self.SCALES["C_major"])
+        chord_tones = self.CHORD_TONES.get(key, self.CHORD_TONES.get("C_major"))
 
         notes = []
+        rhythm_pattern_idx = 0
+
         for section, text in lyric_lines:
-            # Hook 句使用重复型 melody（更有记忆点）
+            # Hook 句使用 AABA 结构重复
             if section == "turning" or "hook" in section:
-                section_notes = self._generate_hook_melody(text, scale)
+                section_notes = self._generate_hook_melody(text, chord_tones)
             else:
-                section_notes = self._generate_line_melody(text, scale, section)
+                # 普通句使用节奏模板 + 和弦音机制
+                section_notes = self._generate_line_melody(
+                    text, scale, chord_tones, section, rhythm_pattern_idx
+                )
+                rhythm_pattern_idx = (rhythm_pattern_idx + 1) % len(self.RHYTHM_PATTERNS)
             notes.extend(section_notes)
 
         return MelodyPlan(key=key, bpm=bpm, notes=notes)
 
-    def _generate_line_melody(self, line: str, scale: list, section: str) -> list:
-        """将一行歌词转换为音符序列"""
+    def _generate_line_melody(
+        self, line: str, scale: list, chord_tones: list, section: str, pattern_idx: int
+    ) -> list:
+        """将一行歌词转换为音符序列（使用节奏模板 + 和弦音机制）"""
+        import random
+
         notes = []
+        pattern = self.RHYTHM_PATTERNS[pattern_idx % len(self.RHYTHM_PATTERNS)]
+        pattern_pos = 0
+
         for i, char in enumerate(line):
             # 标点停顿
             if char in "，。！？":
                 notes.append(Note(pitch="REST", duration=0.5, lyric=char))
+                pattern_pos = 0
                 continue
-            # 跳过空白
             if char.strip() == "":
                 continue
 
-            # 根据位置选择音高（简单上下行）
-            if i == 0:
-                # 第一字用根音
-                pitch = scale[len(scale) // 2]
-            elif i < len(line) // 2:
-                # 前半段上行
+            # 获取当前节奏值
+            duration = pattern[pattern_pos % len(pattern)]
+
+            # 8% 概率随机 REST（呼吸感），不消耗节奏拍
+            if random.random() < 0.08:
+                notes.append(Note(pitch="REST", duration=duration, lyric=""))
+                continue
+
+            # 消耗节奏拍（只有实际音符才推进）
+            pattern_pos = (pattern_pos + 1) % len(pattern)
+
+            # 和弦音机制：强拍用和弦音（每4字一个强拍）
+            is_strong_beat = (i % 4 == 0)
+            if is_strong_beat:
+                # 强拍 → 锚点音（和弦音）
+                pitch = random.choice(chord_tones)
+            else:
+                # 弱拍 → 音阶经过音
                 idx = min(i, len(scale) - 1)
                 pitch = scale[idx]
-            else:
-                # 后半段下行
-                idx = max(0, len(scale) - 1 - (i - len(line) // 2))
-                idx = min(idx, len(scale) - 1)
-                pitch = scale[idx]
-
-            # 根据是否是句尾拉长音
-            duration = 1.0 if i == len(line) - 1 and section != "verse1" else 0.5
 
             notes.append(Note(pitch=pitch, duration=duration, lyric=char))
 
         return notes
 
-    def _generate_hook_melody(self, line: str, scale: list) -> list:
+    def _generate_hook_melody(self, line: str, chord_tones: list) -> list:
         """
-        Hook 句使用重复型旋律（制造洗脑感）
-        基于 HOOK_MELODY 模板循环
+        Hook 句使用 AABA 乐句结构（制造洗脑感）
+        不是逐字循环模板，而是乐句级别的重复
+
+        结构：
+        第1句 → motif A（4字）
+        第2句 → motif A repeat（4字）
+        第3句 → motif B（变化）
+        第4句 → motif A（回归）
         """
+        import random
+
         notes = []
-        hook_idx = 0
-        for i, char in enumerate(line):
-            if char in "，。！？":
-                notes.append(Note(pitch="REST", duration=0.5, lyric=char))
-                continue
-            if char.strip() == "":
-                continue
+        motif_len = 4  # 4字一个小节
+        chars = [c for c in line if c.strip() and c not in "，。！？"]
 
-            # 循环使用 Hook 模板
-            template = self.HOOK_MELODY[hook_idx % len(self.HOOK_MELODY)]
-            pitch = template["pitch"]
-            duration = 0.5  # Hook 句用固定短音，更有节奏感
+        if len(chars) < 4:
+            # 句子太短，退化成普通旋律
+            return self._generate_line_melody(line, chord_tones, chord_tones, "hook", 0)
 
-            notes.append(Note(pitch=pitch, duration=duration, lyric=char))
-            hook_idx += 1
+        # AABA 结构：第1/2/4句用 motif A，第3句用 motif B
+        section_map = []  # (motif_key, char_range)
+        total_chars = len(chars)
+
+        pos = 0
+        # 第1句 A
+        section_map.append(("A", (pos, min(pos + motif_len, total_chars))))
+        pos += motif_len
+        # 第2句 A（重复）
+        if pos < total_chars:
+            section_map.append(("A", (pos, min(pos + motif_len, total_chars))))
+            pos += motif_len
+        # 第3句 B（变化）
+        if pos < total_chars:
+            section_map.append(("B", (pos, min(pos + motif_len, total_chars))))
+            pos += motif_len
+        # 第4句 A（回归）
+        if pos < total_chars:
+            section_map.append(("A", (pos, min(pos + motif_len, total_chars))))
+            pos += motif_len
+
+        # 生成每个乐句的音符
+        motif_idx = 0
+        for motif_key, (start, end) in section_map:
+            motif = self.HOOK_MOTIFS[motif_key]
+            motif_idx = 0
+            for i in range(start, end):
+                if i >= len(chars):
+                    break
+                template = motif[motif_idx % len(motif)]
+                pitch = template[0]
+                duration = 0.5  # Hook 固定短音有节奏感
+                notes.append(Note(pitch=pitch, duration=duration, lyric=chars[i]))
+                motif_idx += 1
+
+            # 乐句之间加 REST（呼吸）
+            if start + motif_len < end:
+                notes.append(Note(pitch="REST", duration=0.5, lyric=""))
 
         return notes
 
@@ -3990,3 +4326,226 @@ class AudioLayer:
             import warnings
             warnings.warn(f"Verse TTS failed: {e}")
         return None
+
+
+# ==================== Song Synthesizer: PerformancePlan → Audio ====================
+# v10: 完整歌曲生成（带旋律/节奏/音高）
+
+
+class SongSynthesizer:
+    """
+    v10 SongSynthesizer - PerformancePlan → 歌曲音频
+
+    功能：
+    1. 将 PerformancePlan 转换为完整歌曲音频
+    2. 使用 pitch-shifted TTS 模拟唱歌（无需外部模型）
+    3. 结合 BGM 混音生成最终作品
+
+    核心区别于 AudioLayer：
+    - AudioLayer: 纯 TTS（朗读感）
+    - SongSynthesizer: 音高曲线 + 节奏 + 人类化（唱歌感）
+
+    使用方式：
+        synthesizer = SongSynthesizer()
+        audio_path = synthesizer.synthesize(performance_plan, emotion_vector, "output/song.mp3")
+    """
+
+    # 基准音高（C4 = 261.63 Hz）
+    PITCH_FREQ = {
+        "C4": 261.63, "D4": 293.66, "E4": 329.63, "F4": 349.23,
+        "G4": 392.00, "A4": 440.00, "B4": 493.88,
+        "C5": 523.25, "D5": 587.33, "E5": 659.25, "F5": 698.46,
+        "G5": 783.99, "A5": 880.00, "B5": 987.77,
+    }
+
+    # 默认基准音（C4）
+    REF_PITCH = "C4"
+    REF_FREQ = 261.63
+
+    def synthesize(
+        self,
+        performance_plan: 'PerformancePlan',
+        emotion_vector: 'EmotionVector',
+        output_path: str = "output/song.mp3",
+    ) -> str:
+        """
+        将 PerformancePlan 合成为歌曲音频
+
+        Args:
+            performance_plan: PerformancePlanner 输出的表演规划
+            emotion_vector: 情绪向量（用于选择 BGM）
+
+        Returns:
+            最终音频文件路径
+        """
+        import os
+        os.makedirs(os.path.dirname(output_path) or "output", exist_ok=True)
+
+        # 1. 生成每个音节的 TTS 音频（带 pitch shift）
+        note_files = []
+        temp_dir = "temp_song"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        for i, note in enumerate(performance_plan.notes):
+            if note.pitch == "REST":
+                continue
+
+            # 查找基准 TTS 文件（已生成的单字/词组）
+            tts_source = self._get_tts_for_lyric(note.lyric, temp_dir)
+            if tts_source is None:
+                continue
+
+            # 计算目标音高对应的 pitch shift（半音数）
+            target_freq = self.PITCH_FREQ.get(note.pitch, 261.63)
+            ref_freq = self.REF_FREQ
+            n_semitones = 12 * (target_freq / ref_freq)
+            shift_semitones = 12 * (n_semitones - 1) if n_semitones > 1 else 0
+
+            # 生成带音高偏移的音频片段
+            pitched_file = os.path.join(temp_dir, f"note_{i:03d}.mp3")
+            self._apply_pitch_shift(tts_source, pitched_file, shift_semitones, note.duration)
+            note_files.append((i, pitched_file, note))
+
+        if not note_files:
+            return None
+
+        # 2. 拼接所有音符片段
+        segments = self._concatenate_notes(note_files, performance_plan)
+
+        # 3. 混音 BGM
+        primary, _ = emotion_vector.get_primary()
+        bgm_key = self._get_bgm_key(primary)
+        bgm_file = os.path.join("assets/bgm", f"{bgm_key}.mp3")
+
+        final_path = self._mix_with_bgm(segments, bgm_file, output_path)
+        return final_path
+
+    def _get_tts_for_lyric(self, lyric: str, temp_dir: str) -> str:
+        """为单个字/词生成 TTS"""
+        if not lyric or lyric.strip() == "":
+            return None
+
+        import asyncio
+        tts_file = os.path.join(temp_dir, f"tts_{lyric.strip()[:2]}.mp3")
+
+        if os.path.exists(tts_file):
+            return tts_file
+
+        try:
+            import edge_tts
+            voice = "zh-CN-XiaoyiNeural"
+            asyncio.run(self._tts_save(lyric.strip(), tts_file, voice))
+            return tts_file if os.path.exists(tts_file) else None
+        except:
+            return None
+
+    async def _tts_save(self, text: str, path: str, voice: str):
+        import edge_tts
+        communicate = edge_tts.Communicate(text, voice=voice)
+        await communicate.save(path)
+
+    def _apply_pitch_shift(self, input_file: str, output_file: str, n_semitones: float, target_duration: float):
+        """
+        对音频施加音高偏移 + 时长调整
+
+        Args:
+            input_file: 输入 TTS 文件
+            output_file: 输出文件
+            n_semitones: 半音偏移数
+            target_duration: 目标持续时间（秒）
+        """
+        try:
+            import librosa
+            import soundfile as sf
+            import numpy as np
+
+            # 加载音频
+            y, sr = librosa.load(input_file, sr=None)
+
+            # 时长调整：语速 = 原始时长 / 目标时长
+            original_duration = len(y) / sr
+            speed_factor = original_duration / target_duration if target_duration > 0 else 1.0
+            speed_factor = max(0.5, min(2.0, speed_factor))  # 限制在 0.5x - 2x
+
+            # 变速
+            y_speed = librosa.effects.time_stretch(y, rate=speed_factor)
+
+            # 变调（pitch shift）
+            if abs(n_semitones) > 0.1:
+                y_pitched = librosa.effects.pitch_shift(y_speed, sr=sr, n_steps=n_semitones)
+            else:
+                y_pitched = y_speed
+
+            # 添加音量包络（根据 target_duration 自然结束）
+            env = np.ones(len(y_pitched))
+            fade_samples = int(sr * 0.1)
+            env[-fade_samples:] = np.linspace(1, 0, fade_samples)
+            y_pitched = y_pitched * env
+
+            sf.write(output_file, y_pitched, sr)
+
+        except ImportError:
+            # 如果 librosa 不可用，直接复制文件
+            import shutil
+            shutil.copy(input_file, output_file)
+        except Exception as e:
+            import shutil
+            shutil.copy(input_file, output_file)
+
+    def _concatenate_notes(self, note_files: list, plan: 'PerformancePlan') -> str:
+        """将所有音符片段拼接为完整音轨"""
+        try:
+            from moviepy.editor import AudioFileClip, concatenate_audioclips
+        except ImportError:
+            return None
+
+        clips = []
+        for i, file_path, note in note_files:
+            if os.path.exists(file_path):
+                clip = AudioFileClip(file_path)
+                clips.append(clip)
+
+        if not clips:
+            return None
+
+        final_audio = concatenate_audioclips(clips)
+        temp_output = "temp_song/full_track.mp3"
+        final_audio.write_audiofile(temp_output, fps=44100)
+        return temp_output
+
+    def _mix_with_bgm(self, vocal_track: str, bgm_file: str, output_path: str) -> str:
+        """人声 + BGM 混音"""
+        try:
+            from moviepy.editor import AudioFileClip, CompositeAudioClip, concataudioclips
+        except ImportError:
+            return None
+
+        if not os.path.exists(vocal_track):
+            return None
+
+        vocal = AudioFileClip(vocal_track)
+        vocal = vocal.volumex(0.8)
+
+        if os.path.exists(bgm_file):
+            bgm = AudioFileClip(bgm_file).loop(duration=vocal.duration).volumex(0.3)
+            final = CompositeAudioClip([bgm, vocal])
+        else:
+            final = vocal
+
+        final.write_audiofile(output_path, fps=44100)
+        return output_path
+
+    def _get_bgm_key(self, emotion: str) -> str:
+        """情绪 → BGM 文件名"""
+        bgm_map = {
+            "sadness": "sad_piano",
+            "nostalgia": "lofi_regret",
+            "loneliness": "empty_room",
+            "regret": "lofi_slow",
+            "anger": "dark_beat",
+            "joy": "upbeat_light",
+            "warmth": "soft_warm",
+            "hope": "soft_warm",
+            "default": "sad_piano",
+        }
+        return bgm_map.get(emotion, bgm_map["default"])

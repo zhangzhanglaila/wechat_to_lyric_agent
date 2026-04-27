@@ -8,7 +8,8 @@ from agent_os import AgentOSKernel, ExecutionGate, StateSnapshotBuilder, StateSn
 from agent_os.art_layer import (
     ArtPipeline, EmotionVector, LyricRhythmSpec, ChatCompressionLayer,
     StylePreset, EmotionCurve, HookGenerator, StylePresetLibrary, HumanRewriteLayer,
-    AudioLayer
+    AudioLayer, MelodyPlanner, PerformancePlanner, MelodyPlan, PerformancePlan,
+    SongSynthesizer
 )
 
 
@@ -43,6 +44,9 @@ class EnhancedAgentOS:
         self.humanizer = HumanRewriteLayer(intensity=0.3)
         self.compression = ChatCompressionLayer()
         self.audio_layer = AudioLayer()  # v9.8: 歌词 → 有声作品
+        self.melody_planner = MelodyPlanner()  # v9.9: 歌词 → 旋律 IR
+        self.performance_planner = PerformancePlanner()  # v10: 旋律 IR → 表演 IR
+        self.song_synthesizer = SongSynthesizer()  # v10: 表演 IR → 歌曲音频
         self.gate = ExecutionGate()
         self.use_art_generation = True
 
@@ -189,6 +193,99 @@ class EnhancedAgentOS:
             "voice": audio_result.get("voice", "unknown"),
             "bgm_file": audio_result.get("bgm_file"),
             "note": audio_result.get("note", ""),
+        }
+
+    def synthesize_song(
+        self,
+        chat_messages: list,
+        output_path: str = "output/song.mp3",
+        humanize_intensity: float = 0.3,
+    ) -> dict:
+        """
+        v10 主接口：微信聊天 → 完整歌曲
+
+        完整 pipeline：
+        微信聊天 → 语义帧 → 歌词 → MelodyPlan → PerformancePlan → 歌曲音频
+
+        Args:
+            chat_messages: 聊天记录
+            output_path: 输出音频文件路径
+            humanize_intensity: 人类化强度
+
+        Returns:
+            dict: {
+                "lyrics": 歌词文本,
+                "melody_plan": MelodyPlan,
+                "performance_plan": PerformancePlan,
+                "song_output": 歌曲文件路径,
+                "duration_sec": 时长,
+                "emotion": 主情绪,
+            }
+        """
+        import os
+
+        # 1. 生成歌词
+        lyric_result = self.generate_lyrics(
+            chat_messages,
+            humanize_intensity=humanize_intensity
+        )
+
+        if "error" in lyric_result:
+            return lyric_result
+
+        # 2. 解析歌词行
+        lyric_lines = []
+        raw_lyrics = lyric_result.get("lyrics", "")
+        lines = raw_lyrics.split("\n")
+
+        current_section = "verse1"
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if "【主歌1】" in line:
+                current_section = "verse1"
+            elif "【主歌2】" in line:
+                current_section = "verse2"
+            elif "【副歌】" in line or "【Hook】" in line:
+                current_section = "hook"
+            elif "【转折】" in line:
+                current_section = "turning"
+            elif "【开场】" in line:
+                current_section = "intro"
+            elif "【结尾】" in line:
+                current_section = "outro"
+            elif line.startswith("【") and line.endswith("】"):
+                current_section = line[1:-1]
+            else:
+                lyric_lines.append((current_section, line))
+
+        if not lyric_lines:
+            return {"error": "No lyric lines parsed"}
+
+        # 3. 获取情绪向量
+        compression_result = self.compression.compress(chat_messages)
+        emotion_vector = compression_result["emotion_vector"]
+
+        # 4. 生成 MelodyPlan
+        melody_plan = self.melody_planner.plan(lyric_lines, emotion_vector)
+
+        # 5. 生成 PerformancePlan
+        performance_plan = self.performance_planner.plan(melody_plan, emotion_vector)
+
+        # 6. 合成歌曲
+        os.makedirs(os.path.dirname(output_path) or "output", exist_ok=True)
+        song_output = self.song_synthesizer.synthesize(performance_plan, emotion_vector, output_path)
+
+        return {
+            "lyrics": lyric_result["lyrics"],
+            "melody_plan": melody_plan,
+            "performance_plan": performance_plan,
+            "song_output": song_output,
+            "duration_sec": len(performance_plan.notes) * 0.5,
+            "emotion": performance_plan.emotion,
+            "key": melody_plan.key,
+            "bpm": melody_plan.bpm,
         }
 
     # 保留旧接口（向后兼容）
