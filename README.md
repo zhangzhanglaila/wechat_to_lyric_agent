@@ -1,183 +1,129 @@
-# 🎤 微信聊天记录 → AI歌词生成器
+# GenWriter Agent - 歌词/诗歌生成引擎
 
-**把任何聊天记录，自动变成一首可以唱的歌**
+**把聊天记录/情绪/关键词，自动变成一首有感染力的歌词或诗**
 
-> 💡 不仅仅是歌词生成器，而是一个「情绪驱动的内容创作引擎」
-
----
-
-## 🎯 一句话定义
-
-输入微信聊天记录，输出：
-- 🎵 **歌词**（有画面感、有Hook、结构完整）
-- 🔊 **有声作品**（TTS + BGM）
-- 🎼 **旋律规划**（MelodyPlan → 可接 DiffSinger）
+> 核心定位：不是"AI写作"，而是"情绪驱动的创作过程建模"
 
 ---
 
-## 🔄 演进路径
+## 一句话定义
 
-| 版本 | 架构 | 核心能力 |
-|------|------|---------|
-| v7.x | Agent OS + ArtPipeline | 人格化歌词生成 |
-| v8.x | HumanRewriteLayer + HookGenerator | 去除AI感，增加传播性 |
-| v9.x | SemanticFrame + NarrativeBuilder | 从"改写"升级为"语义叙事" |
-| **v9.6-v9.9** | **画面化 + Hook强化 + MelodyPlanner** | **从"能跑"到"可传播"** |
+输入：聊天记录 / 关键词 / 情绪描述
+输出：歌词（主歌/副歌/Hook结构）或 诗歌（现代/古典/意象派/日记体）
 
 ---
 
-## 🏗️ System Architecture（v9.9）
+## 架构（v12.x）
 
 ```
-微信聊天记录
-    ↓
-ChatCompression（情绪提取）
-    ↓
-SemanticFrame（语义帧构建）
-    ↓
-NarrativeBuilder（叙事骨架 + 画面化）
-    ↓
-┌─────────────────────────────────────────┐
-│  MelodyPlanner（v9.9 新增）              │
-│  情绪 → 调式/BPM → 音符序列             │
-│  输出 MelodyPlan（IR 层）                │
-└─────────────────────────────────────────┘
-    ↓
-HumanRewriteLayer（人格化改写）
-    ↓
-HookGenerator（爆款句生成）
-    ↓
-┌─────────────────────────────────────────┐
-│  AudioLayer（v9.8 新增）                │
-│  TTS + BGM + 合成音频                   │
-└─────────────────────────────────────────┘
-    ↓
-最终输出（歌词 + 音频 + MelodyPlan）
+输入
+  ↓
+ChatCompressionLayer（聊天记录 → 情绪单元）
+  ↓
+EmotionEngine（情绪 → EmotionVector）
+  ↓
+StructureDSLGenerator（Emotion + Style → 结构化意图）
+  ↓
+TextGenerator（DSL → 各节/行文本）
+  ↓
+HumanRewriteLayer（去除AI感）
+  ↓
+HookGenerator（爆款Hook句）
+  ↓
+CandidateScorer（多候选 + 评分 + Kill规则）
+  ↓
+输出：歌词 / 诗歌 + Hook + 评分
 ```
 
 ---
 
-## 🎵 Demo 示例
+## 核心能力
 
-**输入（微信聊天）：**
-```
-小明：你怎么不回我
-小红：（已读）
-小明：你到底怎么了
-```
-
-**输出歌词（v9.7）：**
-```
-[开场] 你开始不回消息
-[主歌1] 只有我一个人在撑着
-[主歌1] 好像只有我一个人在乎这段关系
-[主歌1] 看着那句话 我发了很久的呆
-[转折] 不是距离远了
-        是心远了
-[结尾] 原来已经回不去了
-```
-
-**输出 MelodyPlan（v9.9）：**
-```
-key: A_minor, bpm: 70
-MIDI events:
-  (0.0, 'D5', 0.5, '你')
-  (0.5, 'B4', 0.5, '不')
-  (1.0, 'G5', 0.5, '是')
-  ...
-```
-
----
-
-## 🔑 核心升级点（v9.x）
-
-### v9.6 画面化升级
-- `VISUAL_TEMPLATES`：画面句替代解释句
-- `IMAGERY`：意象词库增强身临其境感
-- 相邻行去重（去除句内重复感）
-
-### v9.7 Hook强化
-- `HOOK_TEMPLATES`：按 core 分组的爆款候选句
-- frame-conditioned turning（非随机）
-- 两行结构 punch line（视觉冲击）
-
-### v9.8 Audio Layer
-- `AudioLayer.synthesize()`：TTS + BGM → 完整音频
-- 情绪 → 音色/BGM 映射
-- `EnhancedAgentOS.synthesize_audio()`：一键端到端
-
-### v9.9 Melody Layer
-- `MelodyPlanner.plan()`：歌词 → MelodyPlan
-- 情绪 → 调式/BPM 映射（sadness→A_minor/70bpm）
-- `to_midi_events()`：MIDI 事件流（供 DiffSinger 使用）
-- Hook 句使用重复型旋律（制造洗脑感）
-
----
-
-## 🚀 Quick Start
+### 1. 双模式生成
 
 ```bash
-# 安装依赖
-pip install -r requirements.txt
+# 歌词模式（主歌+副歌+Hook，可唱结构）
+python chat2lyric_agent.py --input chat.txt --mode lyrics --style douyin_sad
 
-# 配置 API
-cp .env.example .env
-# 编辑 .env 填入你的 API Key
+# 诗歌模式（多体裁：现代/古典/意象派/日记体）
+python chat2lyric_agent.py --input keywords.txt --mode poem --style modern
+```
 
-# 生成歌词（交互）
-python chat2lyric_agent.py
+### 2. 风格系统
 
-# 生成歌词 + 音频
-python -c "
+| 风格 | 描述 | 适用场景 |
+|------|------|---------|
+| douyin_sad | 抖音伤感风，副歌强Hook | 失落/离别情绪 |
+| rap | 强节奏，快韵脚 | 愤怒/宣泄 |
+| pop | 流行情歌，朗朗上口 | 甜蜜/思念 |
+| emo | 情绪激烈，摇滚感 | 深夜独白 |
+| modern | 现代诗，自由分行 | 文艺表达 |
+| classical | 古典押韵，格律感 | 国风/文言 |
+| imagist | 意象派，短句强画面 | 朦胧情感 |
+| diary | 日记体，第一人称 | 私密倾诉 |
+
+### 3. 多候选 + 评分
+
+默认生成 3 个候选，通过评分排序：
+- 歌词：hook_strength / lyric_variation / emotion_consistency / singability
+- 诗歌：imagery_density / novelty / coherence / emotional_depth
+
+**Kill规则**：某项过低直接大幅扣分，避免bad case
+
+```bash
+# 显示所有候选
+python chat2lyric_agent.py --input chat.txt --mode lyrics --show-candidates
+```
+
+### 4. Structure DSL
+
+情绪 + 风格 → 结构化意图 → 文本
+
+**歌词DSL节类型**：intro / verse / pre_hook / hook / outro
+**诗歌DSL行类型**：image / feeling / contrast / closure
+
+### 5. 可迭代优化
+
+```python
 from agent_os.integration import EnhancedAgentOS
+
 eos = EnhancedAgentOS()
-result = eos.synthesize_audio(chat_messages, output_path='output/song.mp3')
-print(result['lyrics'])
-print('Audio:', result['audio_output'])
-"
+result = eos.generate(
+    content=chat_messages,  # list 或 str
+    mode="lyrics",
+    style="douyin_sad",
+    constraints={"intensity": 0.8},
+    num_candidates=3,
+)
+print(result.text)       # 主结果
+print(result.hook)       # 爆款Hook句
+print(result.candidates)  # 所有候选
+print(result.score)      # 综合评分
 ```
 
 ---
 
-## 📦 依赖
+## 文件结构
+
+```
+agent_os/
+  art_layer.py      # 17个核心类（Emotion/Hook/Style/Narrative）
+  integration.py    # EnhancedAgentOS + StructureDSL + Scorer
+chat2lyric_agent.py # CLI入口
+requirements.txt    # 依赖
+```
+
+---
+
+## 依赖
 
 ```
 openai>=1.0.0
 python-dotenv>=1.0.0
-edge-tts>=6.1.0        # TTS（中文语音合成）
-moviepy>=1.0.3         # 音频合成
-Pillow>=9.0.0          # 图像处理（后续视频用）
 ```
 
 ---
 
-## 🎯 适合谁用？
-
-- 🎤 把聊天记录变成礼物的人
-- 🎵 内容创作者寻找灵感
-- 📱 想要生成「可传播内容」的项目
-- 🧠 对「情绪驱动创作引擎」感兴趣的技术人
-
----
-
-## 📍 下一步演进
-
-```
-v9.9（当前）
-  MelodyPlanner（规则生成）
-      ↓
-v10
-  接 DiffSinger / So-VITS-SVC（真唱）
-  或 pitch-controlled TTS（伪唱）
-      ↓
-v11
-  Hook melody reuse（副歌洗脑）
-  节奏 pattern（抖音风）
-  MV Generator（字幕 + 画面）
-```
-
----
-
-## 📖 License
+## License
 
 MIT
