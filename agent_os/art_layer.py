@@ -512,6 +512,10 @@ class StylePreset(Enum):
     HEARTBREAK = "heartbreak"       # 失恋风格：痛、回忆
     NOSTALGIC = "nostalgic"         # 怀旧风格：温暖、时光感
     DARKNESS = "darkness"           # 暗黑风格：压抑、释放
+    # v12.2: 新增商业化风格
+    DOUYIN_SAD = "douyin_sad"       # 抖音伤感：短平快、Hook洗脑、情绪爆发
+    RAP = "rap"                     # 说唱风格：节奏感强、押韵、态度
+    EMO_POP = "emo_pop"             # Emo流行：情绪外露、自嘲、爆发
 
 
 @dataclass
@@ -587,7 +591,47 @@ class StylePresetLibrary:
             typical_imagery=["夜", "血", "伤口", "深渊", "灰烬"],
             line_starters=["撕裂", "沉没", "燃烧", "崩塌"],
             emotional_keywords=["压抑", "释放", "极端", "狂欢"]
-        )
+        ),
+        # v12.2: 抖音伤感风格（短平快、Hook洗脑、情绪爆发）
+        StylePreset.DOUYIN_SAD: StyleConfig(
+            name="抖音伤感",
+            hook_patterns=[
+                "{}算了",
+                "{}没了",
+                "{}结束了",
+                "{}回不去了",
+                "{}我懂了",
+            ],
+            typical_imagery=["屏幕", "已读", "凌晨", "沉默", "放手"],
+            line_starters=["算了", "不追了", "我以为", "结果", "原来"],
+            emotional_keywords=["爆发", "洗脑", "简短", "重复"]
+        ),
+        # v12.2: 说唱风格（节奏感强、押韵、态度）
+        StylePreset.RAP: StyleConfig(
+            name="说唱",
+            hook_patterns=[
+                "{}别以为",
+                "{}我不说",
+                "{}你懂个屁",
+                "{}老子不服",
+            ],
+            typical_imagery=["街头", "节奏", "麦克风", "舞台", "灯光"],
+            line_starters=["别装了", "我不怕", "你能怎样", "老子", "老子我"],
+            emotional_keywords=["态度", "押韵", "节奏", "爆发"]
+        ),
+        # v12.2: Emo流行风格（情绪外露、自嘲、爆发）
+        StylePreset.EMO_POP: StyleConfig(
+            name="Emo流行",
+            hook_patterns=[
+                "{}我就是个废物",
+                "{}我好想你",
+                "{}我好没用",
+                "{}我真的累了",
+            ],
+            typical_imagery=["眼泪", "凌晨", "被窝", "手机", "黑暗"],
+            line_starters=["我真的", "我好想", "我好没用", "我好累", "对不起"],
+            emotional_keywords=["自嘲", "崩溃", "直接", "情绪"]
+        ),
     }
 
     @classmethod
@@ -608,6 +652,68 @@ class StylePresetLibrary:
         elif emotion_vector.warmth > 0.4:
             return StylePreset.JAY_CHOU
         return StylePreset.HEARTBREAK
+
+
+# ==================== v12.2 风格模板 ====================
+
+@dataclass
+class StyleTemplate:
+    """
+    v12.2 风格模板：控制歌曲的整体形态
+
+    影响维度：
+    - bpm: 速度（快=说唱/emo，慢=伤感/民谣）
+    - hook_repeat: Hook重复次数（2=普通，3=洗脑）
+    - lyric_density: 歌词密度（短句=抖音/说唱，长句=周董/民谣）
+    - expression: 表达方式（直接/含蓄/自嘲）
+    """
+    name: str
+    bpm: int
+    hook_repeat: int         # Hook重复次数
+    lyric_density: str       # "short" / "medium" / "long"
+    expression: str         # "direct" / "metaphor" / "self_mock"
+    pre_hook_enabled: bool   # 是否有Pre-Hook铺垫
+    melody_pattern: str      # "jump" / "smooth" / "flat"
+
+
+# v12.2 风格 → 模板映射
+STYLE_TEMPLATES = {
+    StylePreset.DOUYIN_SAD: StyleTemplate(
+        name="抖音伤感", bpm=90, hook_repeat=3,
+        lyric_density="short", expression="direct",
+        pre_hook_enabled=True, melody_pattern="jump"
+    ),
+    StylePreset.RAP: StyleTemplate(
+        name="说唱", bpm=140, hook_repeat=2,
+        lyric_density="short", expression="direct",
+        pre_hook_enabled=False, melody_pattern="jump"
+    ),
+    StylePreset.EMO_POP: StyleTemplate(
+        name="Emo流行", bpm=110, hook_repeat=3,
+        lyric_density="short", expression="self_mock",
+        pre_hook_enabled=True, melody_pattern="flat"
+    ),
+    StylePreset.HEARTBREAK: StyleTemplate(
+        name="失恋", bpm=75, hook_repeat=2,
+        lyric_density="medium", expression="metaphor",
+        pre_hook_enabled=True, melody_pattern="smooth"
+    ),
+    StylePreset.FOLK: StyleTemplate(
+        name="民谣", bpm=80, hook_repeat=2,
+        lyric_density="long", expression="direct",
+        pre_hook_enabled=False, melody_pattern="smooth"
+    ),
+    StylePreset.JAY_CHOU: StyleTemplate(
+        name="周杰伦", bpm=85, hook_repeat=2,
+        lyric_density="medium", expression="metaphor",
+        pre_hook_enabled=False, melody_pattern="jump"
+    ),
+}
+
+
+def get_style_template(preset: StylePreset) -> StyleTemplate:
+    """获取风格模板"""
+    return STYLE_TEMPLATES.get(preset, STYLE_TEMPLATES[StylePreset.HEARTBREAK])
 
 
 # ==================== Art Layer: Emotion Curve ====================
@@ -2395,6 +2501,22 @@ class NarrativeBuilder:
         "不是你不回 是你早就不想回了",
     ]
 
+    # v12.1: Pre-Hook 铺垫句（在 Hook 前，给情绪蓄力）
+    PRE_HOOK_LINES = [
+        ("我以为你会回", "结果没有"),
+        ("我反复确认", "你根本不在意"),
+        ("我问过自己很多次", "是不是我的问题"),
+        ("等到最后", "什么都没有"),
+    ]
+
+    # v12.1: Hook 重复模板（repeat_count=2~3，短视频爆款结构）
+    # 第一次：原版，第二三次：微变化版
+    HOOK_REPEAT_TEMPLATES = {
+        "var_A": ["懂了", "明白了", "想通了"],
+        "var_B": ["算了", "不追了", "放下了"],
+        "var_C": ["没了", "结束了", "过去了"],
+    }
+
     # v9.7: Hook模板 - 按core分组的爆款候选句
     HOOK_TEMPLATES = {
         "silence": [
@@ -3033,10 +3155,20 @@ class NarrativeBuilder:
             hook_frame = frames[-1] if frames else None
             if hook_frame and hook_frame.core in self.HOOK_TEMPLATES:
                 hooks = self.HOOK_TEMPLATES[hook_frame.core]
-                turning_point = random.choice(hooks)
+                hook_line = random.choice(hooks)
             else:
-                turning_point = random.choice(self.TURNING_PUNCH_LINES)
-            lyric_lines.insert(insert_pos, ('turning', turning_point))
+                hook_line = random.choice(self.TURNING_PUNCH_LINES)
+            # v12.1: 改为 'hook' 标签（之前误标为 'turning'）
+            lyric_lines.insert(insert_pos, ('hook', hook_line))
+        else:
+            # v12.1: insert_pos is None 时，用最后一个 frame 作为 hook_frame
+            hook_frame = frames[-1] if frames else None
+
+        # v12.1: 添加 Pre-Hook 铺垫（在 turning 后、outro 前）
+        lyric_lines = self._add_pre_hook(lyric_lines, arc_type)
+
+        # v12.1: Hook 重复（Hook 乐句出现 2~3 次，制造洗脑感）
+        lyric_lines = self._add_hook_repeat(lyric_lines, hook_frame)
 
         # 结尾（情绪收束）
         if frames:
@@ -3056,6 +3188,119 @@ class NarrativeBuilder:
             "target": "你",
         }
 
+    def _add_pre_hook(self, lyric_lines: list, arc_type: str) -> list:
+        """
+        v12.1 Pre-Hook 铺垫：在 Hook 前加情绪蓄力句
+
+        结构：
+        [主歌2]
+        [Pre-Hook] 我以为你会回 / 结果没有
+        [Hook] 已读不回 我懂了
+        [Outro]
+
+        短视频爆款核心：先铺垫再爆发
+        """
+        import random
+
+        # 找到 Hook 位置
+        hook_idx = None
+        for i, (section, _) in enumerate(lyric_lines):
+            if section == 'hook':
+                hook_idx = i
+                break
+
+        if hook_idx is None or hook_idx == 0:
+            return lyric_lines  # 没有 Hook 或在首位，不加 Pre-Hook
+
+        # Pre-Hook 插入位置（Hook 前两行）
+        pre_insert = max(0, hook_idx - 1)
+
+        # 选择 Pre-Hook 句子（两句一组，形成铺垫）
+        pre_hook_pair = random.choice(self.PRE_HOOK_LINES)
+
+        # 插入 Pre-Hook（两句之间的空行位置）
+        lyric_lines.insert(pre_insert, ('pre_hook', pre_hook_pair[0]))
+        lyric_lines.insert(pre_insert + 1, ('pre_hook', pre_hook_pair[1]))
+
+        return lyric_lines
+
+    def _add_hook_repeat(self, lyric_lines: list, hook_frame) -> list:
+        """
+        v12.1 Hook 重复：Hook 乐句出现 2~3 次，制造洗脑感
+
+        规则：
+        1. Hook 句出现第一次（原始版）
+        2. Hook 句出现第二次（微变化：结尾词替换）
+        3. Hook 句出现第三次（微变化：加语气词）
+
+        例：
+        [Hook] 已读不回 我懂了
+        [Hook] 已读不回 我懂了
+        [Hook] 已读不回 懂了
+
+        短视频爆款：重复3次才能形成记忆点
+        """
+        import random
+
+        # 找到所有 Hook 行
+        hook_indices = [i for i, (s, _) in enumerate(lyric_lines) if s == 'hook']
+
+        if not hook_indices:
+            return lyric_lines  # 没有 Hook
+
+        # 取第一个 Hook 作为模板
+        first_hook_idx = hook_indices[0]
+        original_hook = lyric_lines[first_hook_idx][1]
+
+        # 生成 2~3 次重复（默认 2 次，即总共出现 2 次 Hook）
+        repeat_count = random.randint(2, 3)
+        repeat_positions = []
+
+        for r in range(1, repeat_count):
+            # 微变化的 Hook
+            varied_hook = self._variate_hook(original_hook)
+            # 插入到 Hook 乐句之后（紧邻）
+            insert_pos = first_hook_idx + r  # 每次插入位置后移
+            lyric_lines.insert(insert_pos, ('hook', varied_hook))
+            repeat_positions.append(varied_hook)
+
+        return lyric_lines
+
+    def _variate_hook(self, hook: str) -> str:
+        """
+        v12.1 Hook 微变化：替换结尾词，保留前半结构
+
+        规则：
+        - 替换最后的动词/形容词
+        - 保持前半句不变
+
+        例：
+        原始：已读不回 我懂了
+        变体：已读不回 明白了
+              已读不回 想通了
+              已读不回 算了
+        """
+        import random
+
+        # Hook 结尾变体词库
+        end_variants = ["懂了", "明白了", "想通了", "算了", "没了", "结束了"]
+
+        # 找到 Hook 的最后两个字
+        if len(hook) < 2:
+            return hook
+
+        # 尝试替换结尾
+        for variant in end_variants:
+            if hook.endswith(variant):
+                return hook  # 已经是变体结尾，保持原样
+
+        # 结尾不是变体词，尝试替换最后两个字
+        if len(hook) >= 4:
+            new_end = random.choice(end_variants)
+            return hook[:-2] + new_end
+
+        return hook
+
     def events_to_lines(self, narrative: dict) -> list:
         """
         把叙事骨架转换成歌词行（供 LyricRenderer 使用）
@@ -3070,6 +3315,7 @@ class NarrativeBuilder:
             'intro': '【开场】',
             'verse1': '【主歌1】',
             'verse2': '【主歌2】',
+            'pre_hook': '【前 Hook】',
             'turning': '【转折】',
             'hook': '【Hook】',
             'outro': '【结尾】',
