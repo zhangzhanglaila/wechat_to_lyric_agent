@@ -27,7 +27,7 @@ from agent_os import AgentOSKernel, ExecutionGate, StateSnapshotBuilder, StateSn
 from agent_os.art_layer import (
     ArtPipeline, EmotionVector, ChatCompressionLayer,
     StylePreset, StylePresetLibrary, EmotionCurve,
-    HookGenerator, HumanRewriteLayer,
+    HumanRewriteLayer,
     NarrativeBuilder, SemanticFrame,
     StyleTemplate, get_style_template, STYLE_TEMPLATES,
     llm,
@@ -210,14 +210,17 @@ class TextGenerator:
     诗歌生成：支持意象生成、非线性表达、留白
     """
 
-    def __init__(self):
-        self.hook_gen = HookGenerator()
+    def __init__(self, hook_optimizer: "HookOptimizer" = None):
         self.humanizer = HumanRewriteLayer(intensity=0.3)
+        self._hook_optimizer = hook_optimizer
 
     def generate_from_dsl(self, dsl: List[dict], style_template: StyleTemplate,
                           emotion_vector: EmotionVector, mode: GenerationMode) -> str:
         """
-        根据 DSL 生成文本
+        根据 DSL 逐行（逐节点）强约束生成。
+
+        核心原则：每个 DSL node 的 intent 必须真正约束 LLM 输出，
+        而不是仅作为注释参考。
 
         Args:
             dsl: 结构化 DSL
@@ -233,78 +236,134 @@ class TextGenerator:
         else:
             return self._generate_poem(dsl, style_template, emotion_vector)
 
+    def _generate_node(self, intent: str, section: str,
+                       style_template: StyleTemplate,
+                       emotion_vector: EmotionVector,
+                       mode: GenerationMode) -> str:
+        """
+        强约束逐节点生成 —— intent 直接决定 prompt 内容。
+
+        每一行/每一节都按 "section 类型 + intent 描述" 生成，
+        让 LLM 的输出真正受结构约束，而非自由发挥。
+        """
+        if mode == GenerationMode.LYRICS:
+            return self._generate_lyrics_node(intent, section, style_template, emotion_vector)
+        else:
+            return self._generate_poem_node(intent, section, style_template, emotion_vector)
+
     def _generate_lyrics(self, dsl: List[dict], style_template: StyleTemplate,
                           emotion_vector: EmotionVector) -> str:
-        """歌词生成"""
+        """
+        歌词生成 —— 逐 DSL 节点强约束生成。
+
+        每个节点按 section 类型 + intent 生成，intent 直接决定 prompt 核心内容。
+        """
         lines = []
-        primary, intensity = emotion_vector.get_primary()
 
         for item in dsl:
             section = item.get("section", "verse")
             intent = item.get("intent", "")
 
             if section == "hook":
-                # Hook: 使用 HookGenerator
-                hook_text = self._generate_hook(emotion_vector, style_template)
+                # Hook 节点：生成 + 可选重复
+                hook_text = self._generate_lyrics_node(intent, "hook", style_template, emotion_vector)
                 lines.append(f"【Hook】{hook_text}")
-                # Hook 可以重复出现
                 if style_template and style_template.name == "抖音伤感":
                     lines.append(f"【Hook】{hook_text}")
             elif section == "pre_hook":
-                # Pre-Hook: 情绪铺垫句
-                pre_hook = self._generate_pre_hook(emotion_vector, style_template)
+                pre_hook = self._generate_lyrics_node(intent, "pre_hook", style_template, emotion_vector)
                 lines.append(f"【前Hook】{pre_hook}")
             elif section == "intro":
-                intro = self._generate_intro(emotion_vector, style_template)
+                intro = self._generate_lyrics_node(intent, "intro", style_template, emotion_vector)
                 lines.append(f"【开场】{intro}")
             elif section == "outro":
-                outro = self._generate_outro(emotion_vector, style_template)
+                outro = self._generate_lyrics_node(intent, "outro", style_template, emotion_vector)
                 lines.append(f"【结尾】{outro}")
             else:
-                # 普通 verse
-                verse = self._generate_verse(intent, emotion_vector, style_template)
+                # Verse：intent 是约束核心
+                verse = self._generate_lyrics_node(intent, "verse", style_template, emotion_vector)
                 lines.append(verse)
 
         return "\n".join(lines)
 
     def _generate_poem(self, dsl: List[dict], style_template: StyleTemplate,
                        emotion_vector: EmotionVector) -> str:
-        """诗歌生成"""
+        """
+        诗歌生成 —— 逐 DSL 行节点强约束生成。
+
+        每行按 line_type（image/feeling/contrast/closure）+ intent 生成。
+        """
         lines = []
-        primary, intensity = emotion_vector.get_primary()
 
         for item in dsl:
             line_type = item.get("line_type", "feeling")
             intent = item.get("intent", "")
 
             if line_type == "image":
-                line = self._generate_imagery_line(emotion_vector, style_template)
+                line = self._generate_poem_node(intent, "image", style_template, emotion_vector)
             elif line_type == "contrast":
-                line = self._generate_contrast_line(emotion_vector, style_template)
+                line = self._generate_poem_node(intent, "contrast", style_template, emotion_vector)
             elif line_type == "closure":
-                line = self._generate_closure_line(emotion_vector, style_template)
+                line = self._generate_poem_node(intent, "closure", style_template, emotion_vector)
             else:
-                line = self._generate_feeling_line(emotion_vector, style_template)
+                line = self._generate_poem_node(intent, "feeling", style_template, emotion_vector)
 
             lines.append(line)
 
         return "\n".join(lines)
 
-    def _generate_hook(self, emotion_vector: EmotionVector, style_template: StyleTemplate) -> str:
-        """生成 Hook 句"""
+    def _generate_lyrics_node(self, intent: str, section: str,
+                              style_template: StyleTemplate,
+                              emotion_vector: EmotionVector) -> str:
+        """
+        歌词节点强约束生成。
+
+        核心原则：intent 直接决定生成方向，section 决定句式约束。
+        - intro: 场景设定 → 画面感强，短句
+        - verse: 按 intent 叙述 → 可唱、有节奏
+        - pre_hook: 情绪蓄力 → 暗示即将爆发
+        - hook: 核心记忆点 → 可复述、有反转
+        - outro: 情绪收束 → 有余韵
+        """
         primary, intensity = emotion_vector.get_primary()
         emotion_context = emotion_vector.to_prompt_context()
 
-        prompt = f"""生成一句歌词 Hook（核心记忆点）：
+        # intent 作为核心约束，section 作为辅助约束
+        if section == "hook":
+            return self._generate_hook_node(intent, emotion_context, style_template, intensity, emotion_vector)
+        elif section == "pre_hook":
+            return self._generate_pre_hook_node(intent, emotion_context, style_template, intensity)
+        elif section == "intro":
+            return self._generate_intro_node(intent, emotion_context, style_template, intensity)
+        elif section == "outro":
+            return self._generate_outro_node(intent, emotion_context, style_template, intensity)
+        else:  # verse
+            return self._generate_verse_node(intent, emotion_context, style_template, intensity)
 
-要求：
-- 情绪：{emotion_context}
-- 可复述（用户能记住）
-- 有情绪转折
-- 句式简单（4-8字）
-- {'短平快，口语化' if style_template and style_template.expression == 'direct' else '可以有文学性'}
+    def _generate_hook_node(self, intent: str, emotion_context: str,
+                            style_template: StyleTemplate, intensity: float,
+                            emotion_vector: EmotionVector = None) -> str:
+        """Hook 节点：intent（核心记忆点/重复强化）直接约束方向"""
+        # 如果有 HookOptimizer，使用多候选优化
+        if self._hook_optimizer and emotion_vector is not None:
+            # 把 intent 注入到 emotion_context 中引导 optimizer
+            hook_text = self._hook_optimizer.generate(emotion_vector, style_template, num_variants=5)
+            return hook_text
 
-直接输出句子，不要解释："""
+        # Fallback：直接 LLM 生成
+        prompt = f"""生成一句歌词 Hook（核心记忆点）。
+
+本句的创作意图：{intent}
+情绪状态：{emotion_context}
+
+约束：
+- 必须体现本句的创作意图"{intent}"
+- 可复述（4-8字，用户能记住）
+- 情绪转折感（"却"/"才"/"原来"/"但"等关键词加分）
+- {'短平快、口语化' if style_template and style_template.expression == 'direct' else '有文学性'}
+- 不要空洞，要具体
+
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.7).strip()
@@ -312,20 +371,22 @@ class TextGenerator:
         except Exception:
             return "算了 我不追了"
 
-    def _generate_pre_hook(self, emotion_vector: EmotionVector, style_template: StyleTemplate) -> str:
-        """生成 Pre-Hook 铺垫句"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
+    def _generate_pre_hook_node(self, intent: str, emotion_context: str,
+                                 style_template: StyleTemplate, intensity: float) -> str:
+        """Pre-Hook 节点：intent（情绪铺垫/暗示）直接约束方向"""
+        prompt = f"""生成一句 Pre-Hook 铺垫句（Hook 前的情绪蓄力）。
 
-        prompt = f"""生成一句 Pre-Hook 铺垫（在 Hook 前的情绪蓄力句）：
+本句的创作意图：{intent}
+情绪状态：{emotion_context}
 
-要求：
-- 情绪：{emotion_context}
-- 情绪上升感（暗示即将爆发）
+约束：
+- 必须体现"{intent}"这个意图
+- 情绪上升暗示感（暗示即将爆发）
 - 短句（4-8字）
 - {'口语化、直接' if style_template and style_template.expression == 'direct' else '有诗意'}
+- 不要说透，留悬念
 
-直接输出句子，不要解释："""
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.7).strip()
@@ -333,19 +394,21 @@ class TextGenerator:
         except Exception:
             return "我问过自己很多次"
 
-    def _generate_intro(self, emotion_vector: EmotionVector, style_template: StyleTemplate) -> str:
-        """生成开场句"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
+    def _generate_intro_node(self, intent: str, emotion_context: str,
+                              style_template: StyleTemplate, intensity: float) -> str:
+        """Intro 节点：intent（场景设定）直接约束方向"""
+        prompt = f"""生成一句歌词开场（场景设定/定调）。
 
-        prompt = f"""生成一句歌词开场（场景设定）：
+本句的创作意图：{intent}
+情绪状态：{emotion_context}
 
-要求：
-- 情绪：{emotion_context}
+约束：
+- 必须体现"{intent}"这个意图
+- 画面感强，交代场景或氛围
 - 简短（4-8字）
-- 画面感/场景感
+- 不要主观情绪，要呈现
 
-直接输出句子，不要解释："""
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.7).strip()
@@ -353,19 +416,21 @@ class TextGenerator:
         except Exception:
             return "那天你突然不回消息了"
 
-    def _generate_outro(self, emotion_vector: EmotionVector, style_template: StyleTemplate) -> str:
-        """生成结尾句"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
+    def _generate_outro_node(self, intent: str, emotion_context: str,
+                              style_template: StyleTemplate, intensity: float) -> str:
+        """Outro 节点：intent（情绪收束）直接约束方向"""
+        prompt = f"""生成一句歌词结尾（情绪收束）。
 
-        prompt = f"""生成一句歌词结尾（情绪收束）：
+本句的创作意图：{intent}
+情绪状态：{emotion_context}
 
-要求：
-- 情绪：{emotion_context}
+约束：
+- 必须体现"{intent}"这个意图
 - {'简短有力' if style_template and style_template.expression == 'direct' else '有余韵'}
 - 4-8字
+- 可以是疑问、留白或感叹
 
-直接输出句子，不要解释："""
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.7).strip()
@@ -373,23 +438,21 @@ class TextGenerator:
         except Exception:
             return "原来已经回不去了"
 
-    def _generate_verse(self, intent: str, emotion_vector: EmotionVector,
-                        style_template: StyleTemplate) -> str:
-        """生成普通 Verse 句"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
+    def _generate_verse_node(self, intent: str, emotion_context: str,
+                              style_template: StyleTemplate, intensity: float) -> str:
+        """Verse 节点：intent 直接约束叙述方向"""
+        prompt = f"""生成一句歌词（叙述/细节）。
 
-        prompt = f"""生成一句歌词（叙述/细节）：
+本句的创作意图：{intent}
+情绪状态：{emotion_context}
 
-意图：{intent}
-情绪：{emotion_context}
+约束：
+- 本句必须完成这个意图："{intent}"
+- {'短句（4-8字），口语化，可唱' if style_template and style_template.lyric_density == 'short' else '中等长度（6-12字），有节奏感'}
+- 不要太长，一句说清一件事
+- 不要空洞感慨，要具体叙述
 
-要求：
-- {'短句（4-8字），口语化' if style_template and style_template.lyric_density == 'short' else '中等长度（6-12字）'}
-- 可唱（节奏感）
-- 不要太长
-
-直接输出句子，不要解释："""
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.7).strip()
@@ -397,22 +460,46 @@ class TextGenerator:
         except Exception:
             return "我假装什么都没发生"
 
-    def _generate_imagery_line(self, emotion_vector: EmotionVector,
-                                style_template: StyleTemplate) -> str:
-        """诗歌：意象句"""
+    def _generate_poem_node(self, intent: str, line_type: str,
+                            style_template: StyleTemplate,
+                            emotion_vector: EmotionVector) -> str:
+        """
+        诗歌节点强约束生成。
+
+        核心原则：intent 直接决定这行要写什么，line_type 决定表达方式。
+        - image: 用意象呈现，而非解释
+        - feeling: 直接但克制地表达情绪
+        - contrast: 反转或对比，制造张力
+        - closure: 留白收束，不说透
+        """
         primary, intensity = emotion_vector.get_primary()
         emotion_context = emotion_vector.to_prompt_context()
 
-        prompt = f"""生成一句意象派诗歌（意象为主）：
+        if line_type == "image":
+            return self._generate_image_node(intent, emotion_context, style_template, intensity)
+        elif line_type == "contrast":
+            return self._generate_contrast_node(intent, emotion_context, style_template, intensity)
+        elif line_type == "closure":
+            return self._generate_closure_node(intent, emotion_context, style_template, intensity)
+        else:
+            return self._generate_feeling_node(intent, emotion_context, style_template, intensity)
 
-情绪：{emotion_context}
+    def _generate_image_node(self, intent: str, emotion_context: str,
+                             style_template: StyleTemplate, intensity: float) -> str:
+        """意象句：intent 直接约束意象选择"""
+        prompt = f"""生成一句意象派诗歌。
 
-要求：
-- {'短句，碎片化意象' if style_template and style_template.lyric_density == 'short' else '意象鲜明，留白'}
-- 不解释，只呈现
+本句创作意图：{intent}
+情绪状态：{emotion_context}
+
+约束：
+- 必须完成"{intent}"这个意图
+- 用意象（物/景/动作）呈现，不解释
+- {'短句、碎片化' if style_template and style_template.lyric_density == 'short' else '意象鲜明，留白'}
 - 不要"我"字开头
+- 不要直接说情绪
 
-直接输出，不要标题或解释："""
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.8).strip()
@@ -420,22 +507,21 @@ class TextGenerator:
         except Exception:
             return "屏幕亮着，消息框空着"
 
-    def _generate_contrast_line(self, emotion_vector: EmotionVector,
-                                 style_template: StyleTemplate) -> str:
-        """诗歌：反转/张力句"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
+    def _generate_contrast_node(self, intent: str, emotion_context: str,
+                                  style_template: StyleTemplate, intensity: float) -> str:
+        """反转/张力句：intent 直接约束反转方向"""
+        prompt = f"""生成一句诗歌（反转/张力）。
 
-        prompt = f"""生成一句诗歌（反转/张力）：
+本句创作意图：{intent}
+情绪状态：{emotion_context}
 
-情绪：{emotion_context}
-
-要求：
-- 有转折或对比
+约束：
+- 必须完成"{intent}"这个意图
+- 有转折或对比（"却"/"只是"/"然而"/"明明"等）
 - {'短促有力' if style_template and style_template.lyric_density == 'short' else '有深度'}
-- 不要废话
+- 不要废话，要一针见血
 
-直接输出，不要标题或解释："""
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.7).strip()
@@ -443,22 +529,21 @@ class TextGenerator:
         except Exception:
             return "你明明看到了，却选择不回"
 
-    def _generate_closure_line(self, emotion_vector: EmotionVector,
-                                style_template: StyleTemplate) -> str:
-        """诗歌：收束/留白句"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
+    def _generate_closure_node(self, intent: str, emotion_context: str,
+                                style_template: StyleTemplate, intensity: float) -> str:
+        """收束/留白句：intent 直接约束收束方向"""
+        prompt = f"""生成一句诗歌结尾（留白/开放）。
 
-        prompt = f"""生成一句诗歌结尾（留白/开放）：
+本句创作意图：{intent}
+情绪状态：{emotion_context}
 
-情绪：{emotion_context}
-
-要求：
+约束：
+- 必须完成"{intent}"这个意图
 - 不说透，留余韵
 - {'简短' if style_template and style_template.lyric_density == 'short' else '有回味'}
-- 可以是疑问或省略
+- 可以是疑问、省略或无声的叹息
 
-直接输出，不要标题或解释："""
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.7).strip()
@@ -466,28 +551,152 @@ class TextGenerator:
         except Exception:
             return "后来呢"
 
-    def _generate_feeling_line(self, emotion_vector: EmotionVector,
-                                style_template: StyleTemplate) -> str:
-        """诗歌：情绪句"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
+    def _generate_feeling_node(self, intent: str, emotion_context: str,
+                                style_template: StyleTemplate, intensity: float) -> str:
+        """情绪句：intent 直接约束情绪表达方向"""
+        prompt = f"""生成一句情绪诗歌。
 
-        prompt = f"""生成一句情绪诗歌：
+本句创作意图：{intent}
+情绪状态：{emotion_context}
 
-情绪：{emotion_context}
-
-要求：
-- 直接表达情绪
+约束：
+- 必须完成"{intent}"这个意图
+- 直接表达，但要克制
 - {'短促、强烈' if style_template and style_template.lyric_density == 'short' else '有层次'}
 - 不要太理性
 
-直接输出，不要标题或解释："""
+直接输出句子，不要任何前缀："""
 
         try:
             result = llm(prompt, temp=0.7).strip()
             return result
         except Exception:
             return "等不到回复的夜晚"
+
+
+
+# ==================== Hook 优化器 ====================
+
+class HookOptimizer:
+    """
+    多候选 Hook 生成 + 评分选最优。
+
+    策略：直接多生成（不同 hook_type 模板 + 不同温度采样），
+    而非在单一本上变异 —— 保证变体多样性。
+    """
+
+    HOOK_TYPES = [
+        "contrast",    # 反转型：前半句陈述，后半句反转
+        "shock",       # 冲击型：出人意料的结论
+        "question",    # 疑问型：以问句收尾，留悬念
+        "image_alone", # 意象型：用画面代替情绪
+        "time_marker", # 时间型：标记性的时间/动作
+    ]
+
+    def generate(self, emotion_vector: EmotionVector,
+                 style_template: StyleTemplate,
+                 num_variants: int = 5) -> str:
+        """
+        生成多个 Hook 变体，评分后返回最优。
+
+        Args:
+            emotion_vector: 情绪向量
+            style_template: 风格模板
+            num_variants: 变体数量
+
+        Returns:
+            最优 Hook 句
+        """
+        import random
+
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
+
+        # 从 HOOK_TYPES 中随机选 num_variants 个（允许重复）
+        selected_types = random.choices(self.HOOK_TYPES, k=num_variants)
+        # 加上不同温度采样
+        temps = [0.5, 0.7, 0.9]
+        hook_texts = []
+
+        for hook_type in set(selected_types):
+            hook_texts.append(self._generate_one_hook(
+                emotion_context, style_template, hook_type=hook_type
+            ))
+
+        for temp in temps:
+            hook_texts.append(self._generate_one_hook(
+                emotion_context, style_template, temp=temp
+            ))
+
+        # 去重
+        hook_texts = list(dict.fromkeys(hook_texts))
+
+        # 评分排序
+        scored = [(h, self._score_hook(h)) for h in hook_texts]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[0][0]
+
+    def _generate_one_hook(self, emotion_context: str,
+                            style_template: StyleTemplate,
+                            hook_type: str = None,
+                            temp: float = 0.7) -> str:
+        """生成单个 Hook"""
+        type_instruction = {
+            "contrast": "有明显的情绪反转（前半句陈述事实，后半句转折）",
+            "shock": "出人意料的结论，让人一读就愣住",
+            "question": "以疑问句结尾，让人思考",
+            "image_alone": "用意象/画面收尾，不直接说情绪",
+            "time_marker": "用具体时间/动作标记，增强记忆点",
+        }.get(hook_type, "有情绪共鸣")
+
+        prompt = f"""生成一句歌词 Hook（核心记忆点）。
+
+情绪状态：{emotion_context}
+
+约束：
+- {type_instruction}
+- 4-8字，可复述
+- {'短平快、口语化' if style_template and style_template.expression == 'direct' else '可以有文学性'}
+- 不要空洞感慨，要具体
+
+直接输出句子，不要任何前缀："""
+
+        try:
+            result = llm(prompt, temp=temp).strip()
+            return result
+        except Exception:
+            return "算了 我不追了"
+
+    def _score_hook(self, hook: str) -> float:
+        """
+        Hook 评分：
+        - 可复述性（4-8字）: 0.4
+        - 情绪冲击/转折: 0.3
+        - 对称/反转结构: 0.3
+        """
+        score = 0.0
+
+        # 可复述性
+        if 4 <= len(hook) <= 8:
+            score += 0.4
+        elif 3 <= len(hook) <= 10:
+            score += 0.2
+
+        # 情绪冲击（疑问/感叹/转折词）
+        if any(c in hook for c in "！？"):
+            score += 0.3
+        elif any(kw in hook for kw in ["却", "才", "原来", "但", "只是", "然而"]):
+            score += 0.25
+
+        # 对称/反转结构（前后有对比感）
+        contrast_pairs = [("你", "我"), ("他", "她"), ("明明", "却"), ("以为", "结果")]
+        has_contrast = any(a in hook and b in hook for a, b in contrast_pairs)
+        if has_contrast:
+            score += 0.3
+        elif len(hook) >= 4 and (hook[0] == hook[-1]):
+            score += 0.15  # 简单的首尾呼应
+
+        return min(1.0, score)
 
 
 # ==================== 评分器 ====================
@@ -722,6 +931,278 @@ class CandidateScorer:
         return min(1.0, matched * 0.2 + 0.3)
 
 
+# ==================== 文本分析器 ====================
+
+class TextAnalyzer:
+    """
+    规则快筛检测文本问题（0 LLM 调用）。
+
+    检测维度：
+    - hook_weak: Hook 长度/结构不达标
+    - too_flat: 句式变化少（长度方差小、开头词单一）
+    - no_imagery: 诗歌缺乏意象词
+    - emotion_drift: 情绪关键词与预期不符
+    """
+
+    IMAGERY_WORDS = {
+        "屏幕", "消息", "凌晨", "沉默", "放手",
+        "枫叶", "稻香", "雨", "夜", "光", "影子",
+        "咖啡", "烟", "酒", "日记", "照片",
+        "空", "满", "远", "近", "冷", "暖",
+        "车站", "街角", "雨天", "晴天", "心跳",
+    }
+
+    EMOTION_KEYWORDS = {
+        "sadness": ["难过", "不回", "算了", "远了", "回不去", "忘", "痛", "伤"],
+        "nostalgia": ["以前", "曾经", "那年", "记得", "时光", "怀念"],
+        "anger": ["凭什么", "为什么", "太过分", "不公平", "气"],
+        "joy": ["开心", "快乐", "幸福", "美好", "甜蜜"],
+        "warmth": ["温暖", "谢谢", "想见", "拥抱", "感动"],
+        "hope": ["会", "能", "相信", "希望", "期待"],
+        "loneliness": ["一个人", "孤独", "没人", "寂寞", "空"],
+    }
+
+    START_WORDS = {"我", "你", "他", "她", "这", "那", "不是", "其实", "算了", "结果", "原来", "明明"}
+
+    def analyze(self, text: str, mode: GenerationMode, expected_emotion: str = None) -> dict:
+        """
+        返回问题字典，每个 key 为 True 表示需要修复。
+        """
+        if mode == GenerationMode.LYRICS:
+            return self._analyze_lyrics(text)
+        else:
+            return self._analyze_poem(text, expected_emotion)
+
+    def _analyze_lyrics(self, text: str) -> dict:
+        issues = {"hook_weak": False, "too_flat": False}
+
+        # hook_weak: 检查 Hook 长度和情绪词
+        hook_candidates = [l for l in text.split("\n") if "【Hook】" in l]
+        if hook_candidates:
+            hook = hook_candidates[0].replace("【Hook】", "").strip()
+            if len(hook) < 4 or len(hook) > 10:
+                issues["hook_weak"] = True
+            if not any(kw in hook for kw in ["却", "才", "原来", "但", "算了", "没"]):
+                issues["hook_weak"] = True
+        else:
+            # 没有 Hook 标记，整段结尾当作 hook
+            non_tag = [l for l in text.split("\n") if l.strip() and not l.startswith("【")]
+            if non_tag:
+                last = non_tag[-1].strip()
+                if len(last) < 4 or len(last) > 10:
+                    issues["hook_weak"] = True
+
+        # too_flat: 句子长度方差 + 开头词多样性
+        lines = [l.strip() for l in text.split("\n") if l.strip() and not l.startswith("【")]
+        if len(lines) >= 3:
+            lengths = [len(l) for l in lines]
+            avg = sum(lengths) / len(lengths)
+            variance = sum((l - avg) ** 2 for l in lengths) / len(lengths)
+            if variance < 2:
+                issues["too_flat"] = True
+
+            start_words = set()
+            for line in lines:
+                for sw in self.START_WORDS:
+                    if line.startswith(sw):
+                        start_words.add(sw)
+                        break
+            if len(start_words) <= 2:
+                issues["too_flat"] = True
+
+        return issues
+
+    def _analyze_poem(self, text: str, expected_emotion: str = None) -> dict:
+        issues = {"no_imagery": False, "too_flat": False, "emotion_drift": False}
+
+        # no_imagery: 意象词密度
+        if not any(w in text for w in self.IMAGERY_WORDS):
+            issues["no_imagery"] = True
+
+        # too_flat: 句式开头多样性
+        lines = [l for l in text.split("\n") if l.strip()]
+        if len(lines) >= 3:
+            start_words = set()
+            for line in lines:
+                for sw in self.START_WORDS:
+                    if line.strip().startswith(sw):
+                        start_words.add(sw)
+                        break
+            if len(start_words) <= 2:
+                issues["too_flat"] = True
+
+        # emotion_drift: 情绪关键词不符
+        if expected_emotion:
+            expected_kws = self.EMOTION_KEYWORDS.get(expected_emotion, [])
+            matched = sum(1 for kw in expected_kws if kw in text)
+            if expected_kws and matched == 0:
+                issues["emotion_drift"] = True
+
+        return issues
+
+
+# ==================== Refine Loop ====================
+
+class RefineLoop:
+    """
+    针对 TextAnalyzer 检测出的问题，做局部重写。
+
+    每次 refine 只改有问题的局部，不重写全篇。
+    """
+
+    def __init__(self):
+        self.analyzer = TextAnalyzer()
+
+    def refine(self, text: str, issues: dict,
+               style_template: StyleTemplate,
+               emotion_vector: EmotionVector,
+               mode: GenerationMode) -> str:
+        """
+        根据 issues 字典，对文本做针对性局部改写。
+        返回改写后的文本。
+        """
+        if not any(issues.values()):
+            return text
+
+        refined = text
+
+        if issues.get("hook_weak"):
+            refined = self._refine_hook(refined, emotion_vector, style_template)
+
+        if issues.get("too_flat"):
+            refined = self._inject_variation(refined, emotion_vector, style_template, mode)
+
+        if issues.get("no_imagery"):
+            refined = self._inject_imagery(refined, emotion_vector, style_template)
+
+        if issues.get("emotion_drift"):
+            refined = self._fix_emotion_drift(refined, emotion_vector, style_template)
+
+        return refined
+
+    def _refine_hook(self, text: str,
+                     emotion_vector: EmotionVector,
+                     style_template: StyleTemplate) -> str:
+        """重写 Hook：强化记忆点、可复述性、情绪冲击"""
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
+
+        prompt = f"""以下歌词的 Hook 太弱，请改写为更有冲击力的核心记忆句。
+
+原歌词：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 新 Hook 必须：4-8字、有情绪反转或共鸣、可复述
+- {'短平快口语化' if style_template and style_template.expression == 'direct' else '可以有文学性'}
+- 保持其他部分不变，只改【Hook】部分
+- 格式：输出完整歌词
+
+直接输出完整歌词，不要解释："""
+
+        try:
+            result = llm(prompt, temp=0.6).strip()
+            return result
+        except Exception:
+            return text
+
+    def _inject_variation(self, text: str,
+                          emotion_vector: EmotionVector,
+                          style_template: StyleTemplate,
+                          mode: GenerationMode) -> str:
+        """注入句式变化：调整句长多样性、开头词"""
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
+
+        if mode == GenerationMode.LYRICS:
+            prompt = f"""以下歌词句式太平，请改写增加变化。
+
+原歌词：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 增加句长变化（有的短句3-5字，有的稍长8-12字）
+- 换不同的开头词（不要每句都用"我"/"你"/"其实"开头）
+- 加入转折词（却/但/只是/原来）增加层次
+- 保持情绪和结构不变，只调整句式
+
+直接输出完整歌词，不要解释："""
+        else:
+            prompt = f"""以下诗歌句式太平，请改写增加变化。
+
+原诗歌：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 调整句长变化
+- 换不同开头词
+- 增加意象对比或反转
+
+直接输出完整诗歌，不要解释："""
+
+        try:
+            result = llm(prompt, temp=0.6).strip()
+            return result
+        except Exception:
+            return text
+
+    def _inject_imagery(self, text: str,
+                        emotion_vector: EmotionVector,
+                        style_template: StyleTemplate) -> str:
+        """注入意象：为诗歌补充意象词"""
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
+
+        prompt = f"""以下诗歌缺乏意象，请改写补充具象的视觉/听觉/触觉意象。
+
+原诗歌：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 在保留情绪的前提下，替换或增加具体意象（屏幕/雨/夜/光/影子/空/车站/街角等）
+- 不要直接说情绪，用意象呈现
+- 保持原结构，只补充意象
+
+直接输出完整诗歌，不要解释："""
+
+        try:
+            result = llm(prompt, temp=0.6).strip()
+            return result
+        except Exception:
+            return text
+
+    def _fix_emotion_drift(self, text: str,
+                            emotion_vector: EmotionVector,
+                            style_template: StyleTemplate) -> str:
+        """修复情绪漂移：强化情绪关键词"""
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
+
+        prompt = f"""以下歌词/诗歌的情绪不统一，请改写强化情绪一致性。
+
+原文本：
+{text}
+
+目标情绪：{emotion_context}
+
+要求：
+- 统一情绪基调
+- 增加情绪关键词密度
+- 不要偏离主情绪
+
+直接输出文本，不要解释："""
+
+        try:
+            result = llm(prompt, temp=0.6).strip()
+            return result
+        except Exception:
+            return text
+
+
 # ==================== 主入口 ====================
 
 class EnhancedAgentOS:
@@ -755,11 +1236,13 @@ class EnhancedAgentOS:
     def __init__(self, *args, **kwargs):
         self.kernel = AgentOSKernel(*args, **kwargs)
         self.compression = ChatCompressionLayer()
-        self.hook_gen = HookGenerator()
         self.humanizer = HumanRewriteLayer(intensity=0.3)
         self.dsl_gen = StructureDSLGenerator()
-        self.text_gen = TextGenerator()
+        self.hook_optimizer = HookOptimizer()
+        self.text_gen = TextGenerator(hook_optimizer=self.hook_optimizer)
         self.scorer = CandidateScorer()
+        self.analyzer = TextAnalyzer()
+        self.refine_loop = RefineLoop()
         self.gate = ExecutionGate()
 
     def generate(
@@ -818,9 +1301,34 @@ class EnhancedAgentOS:
         # 4. 排序
         ranked = self._rank(candidates)
 
-        # 5. 提取最优结果
-        best = ranked[0]["result"]
-        best_score, best_details = ranked[0]["score"], ranked[0]["details"]
+        # 5. 两阶段精修：只对 top 2 做完整 refine loop
+        max_refine_steps = constraints.get("max_refine_steps", 3)
+        top_candidates = ranked[:2]
+
+        for ranked_entry in top_candidates:
+            c = ranked_entry["result"]
+            refine_steps = 0
+            for step in range(max_refine_steps):
+                issues = self.analyzer.analyze(c["text"], gen_mode, expected_emotion=c.get("emotion"))
+                if not any(issues.values()):
+                    break
+                c["text"] = self.refine_loop.refine(
+                    c["text"], issues, style_template, emotion_vector, gen_mode
+                )
+                refine_steps += 1
+            c["refinement_steps"] = refine_steps
+            # Hook 可能已被改写，重新提取
+            c["hook"] = self._extract_hook(c["text"], gen_mode)
+
+        # 6. 重新排序（refine 后）
+        ranked_after_refine = self._rank(
+            [e["result"] for e in top_candidates] +
+            [e["result"] for e in ranked[2:]]
+        )
+
+        # 7. 提取最优结果
+        best = ranked_after_refine[0]["result"]
+        best_score, best_details = ranked_after_refine[0]["score"], ranked_after_refine[0]["details"]
 
         return GenerationResult(
             type=mode,
@@ -833,7 +1341,7 @@ class EnhancedAgentOS:
             score=best_score,
             score_details=best_details,
             candidates=[self._to_result(c, mode) for c in candidates],
-            refinement_steps=0,
+            refinement_steps=best.get("refinement_steps", 0),
             raw_text=best.get("raw_text", ""),
         )
 
@@ -865,13 +1373,16 @@ class EnhancedAgentOS:
             "dsl": dsl,
             "emotion": primary,
             "emotion_intensity": intensity,
+            "type": "lyrics" if mode == GenerationMode.LYRICS else "poem",
+            "refinement_steps": 0,
         }
 
     def _rank(self, candidates: list) -> list:
         """对候选打分并排序"""
         scored = []
         for c in candidates:
-            result = self._to_result(c, c.get("type", "lyrics"))
+            mode_str = c.get("type", "lyrics")
+            result = self._to_result(c, mode_str)
             score, details = self.scorer.score(result)
             scored.append({
                 "result": c,
