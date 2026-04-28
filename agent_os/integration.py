@@ -41,6 +41,36 @@ class GenerationMode(Enum):
     POEM = "poem"        # 诗歌（多体裁）
 
 
+# ==================== 用户控制维度（统一协议）====================
+
+@dataclass
+class LyricSectionConstraint:
+    """歌词节级约束（用户可控）"""
+    repeat: int = 1           # 该节重复次数
+    max_len: int = 10         # 最大句长
+    min_len: int = 4          # 最小句长
+    imagery_density: float = 0.3  # 意象密度 0~1
+    emotion_level: float = 0.5    # 情绪强度 0~1
+
+
+@dataclass
+class PoemLineConstraint:
+    """诗歌行级约束（用户可控）"""
+    max_len: int = 20             # 最大字数
+    imagery_required: bool = False # 是否强制意象
+    rhyme_required: bool = False  # 是否要求押韵
+    contrast_required: bool = False  # 是否要求反转
+
+
+# 用户可编辑 DSL 结构（外显化）
+# 歌词结构示例：
+#   [{"section": "intro", "intent": "场景设定"},
+#    {"section": "hook", "intent": "核心记忆点", "constraint": LyricSectionConstraint(max_len=8)}]
+# 诗歌结构示例：
+#   [{"line_type": "image", "intent": "意象开场"},
+#    {"line_type": "contrast", "intent": "反转", "constraint": PoemLineConstraint(imagery_required=True)}]
+
+
 # ==================== 统一生成结果 ====================
 
 @dataclass
@@ -58,6 +88,8 @@ class GenerationResult:
     candidates: List['GenerationResult'] = field(default_factory=list)  # 候选列表
     refinement_steps: int = 0  # 迭代优化次数
     raw_text: str = ""        # 人类化之前的文本
+    # 创作解释（生成过程可解释）
+    creation_explanation: Dict[str, Any] = field(default_factory=dict)
 
 
 # ==================== DSL 生成器 ====================
@@ -158,24 +190,74 @@ class StructureDSLGenerator:
     }
 
     def generate(self, emotion_vector: EmotionVector, mode: GenerationMode,
-                 style_template: StyleTemplate) -> List[dict]:
+                 style_template: StyleTemplate,
+                 user_structure: list = None,
+                 poem_form: str = None) -> List[dict]:
         """
-        根据情绪和风格生成 DSL
+        根据情绪和风格生成 DSL。
+
+        优先级：
+        1. user_structure（用户自定义 DSL）—— 最高优先，完全覆盖
+        2. poem_form（诗歌体裁约束）—— 次优先
+        3. style_template 推断模板 —— 默认
+
+        Args:
+            user_structure: 用户提供的 DSL 列表，直接使用，不做推断
+            poem_form: 诗歌体裁（"free" / "classical" / "imagist" / "diary"）
 
         Returns:
-            List[dict]: 结构化 DSL 列表
+            List[dict]: 结构化 DSL 列表，每项包含 section/line_type + intent + 可选 constraint
         """
-        import random
+        # 最高优先：用户直接提供 DSL
+        if user_structure is not None:
+            return list(user_structure)
 
         if mode == GenerationMode.LYRICS:
             style_key = self._lyrics_style_key(style_template)
             templates = self.LYRICS_DSL_TEMPLATES
+            dsl = templates.get(style_key, templates["default"])
         else:
-            style_key = self._poem_style_key(style_template)
+            # poem_form 覆盖 style 推断
+            effective_form = poem_form or self._poem_form_from_style(style_template)
             templates = self.POEM_DSL_TEMPLATES
+            dsl = templates.get(effective_form, templates["modern"])
 
-        dsl = templates.get(style_key, templates["default"])
-        return list(dsl)  # 返回副本
+        return list(dsl)
+
+    def _lyrics_style_key(self, tpl: StyleTemplate) -> str:
+        """从 StyleTemplate 推断歌词 DSL 类型"""
+        name = tpl.name.lower()
+        if "抖音" in name or "sad" in name:
+            return "douyin_sad"
+        elif "说唱" in name or "rap" in name:
+            return "rap"
+        elif "流行" in name:
+            return "pop"
+        return "default"
+
+    def _poem_style_key(self, tpl: StyleTemplate) -> str:
+        """从 StyleTemplate 推断诗歌 DSL 类型"""
+        name = tpl.name.lower()
+        if "古风" in name:
+            return "classical"
+        elif "意象" in name:
+            return "imagist"
+        elif "日记" in name:
+            return "diary"
+        return "modern"
+
+    def _poem_form_from_style(self, tpl: StyleTemplate) -> str:
+        """从 StyleTemplate 推断诗歌体裁"""
+        if hasattr(tpl, 'poem_form') and tpl.poem_form:
+            return tpl.poem_form
+        name = tpl.name.lower()
+        if "古风" in name:
+            return "classical"
+        elif "意象" in name:
+            return "imagist"
+        elif "日记" in name:
+            return "diary"
+        return "modern"
 
     def _lyrics_style_key(self, tpl: StyleTemplate) -> str:
         """从 StyleTemplate 推断歌词 DSL 类型"""
@@ -699,6 +781,88 @@ class HookOptimizer:
         return min(1.0, score)
 
 
+# ==================== 目标函数 ====================
+
+class ObjectiveFunction:
+    """
+    可驱动优化的目标函数。
+
+    与 CandidateScorer 的区别：
+    - CandidateScorer：评估已知候选，给出分数
+    - ObjectiveFunction：驱动优化过程，可比较多个候选
+
+    设计原则：
+    - 权重可配置（不硬编码）
+    - 可对原始文本直接打分（无需 GenerationResult）
+    - 返回 (总分, 详情)，详情可直接用于比较
+    """
+
+    LYRICS_WEIGHTS = {
+        "hook_strength": 0.35,
+        "lyric_variation": 0.20,
+        "emotion_consistency": 0.25,
+        "singability": 0.20,
+    }
+
+    POEM_WEIGHTS = {
+        "imagery_density": 0.30,
+        "novelty": 0.20,
+        "coherence": 0.20,
+        "emotional_depth": 0.30,
+    }
+
+    def __init__(self, mode: "GenerationMode" = None, weights: dict = None):
+        """
+        Args:
+            mode: GenerationMode.LYRICS 或 POEM，决定使用哪套权重
+            weights: 可选，覆盖默认权重，如 {"hook_strength": 0.4, ...}
+        """
+        self._mode = mode
+        self._weights = weights
+
+    def score(self, result: "GenerationResult") -> float:
+        """
+        对 GenerationResult 打目标分（用于 rank）。
+        """
+        if result.type == "lyrics":
+            weights = self._resolve_weights("lyrics")
+            total = sum(
+                result.score_details.get(k, 0.0) * w
+                for k, w in weights.items()
+            )
+        else:
+            weights = self._resolve_weights("poem")
+            total = sum(
+                result.score_details.get(k, 0.0) * w
+                for k, w in weights.items()
+            )
+        return total
+
+    def score_text(self, text: str, hook: str, emotion: str,
+                   mode: "GenerationMode") -> float:
+        """
+        对原始文本打分（无需 GenerationResult）。
+        用于 RefineLoop 中比较多候选/变体。
+        """
+        scorer = CandidateScorer()
+        dummy_result = GenerationResult(
+            type="lyrics" if mode == GenerationMode.LYRICS else "poem",
+            style="", text=text, hook=hook,
+            structure_dsl=[], emotion=emotion,
+            emotion_intensity=0.5, score=0.0, score_details={},
+        )
+        _, details = scorer.score(dummy_result)
+        weights = self._resolve_weights(dummy_result.type)
+        return sum(details.get(k, 0.0) * w for k, w in weights.items())
+
+    def _resolve_weights(self, result_type: str) -> dict:
+        if self._weights:
+            return self._weights
+        if result_type == "lyrics":
+            return dict(self.LYRICS_WEIGHTS)
+        return dict(self.POEM_WEIGHTS)
+
+
 # ==================== 评分器 ====================
 
 class CandidateScorer:
@@ -931,6 +1095,86 @@ class CandidateScorer:
         return min(1.0, matched * 0.2 + 0.3)
 
 
+# ==================== 风格一致性约束 ====================
+
+class StyleChecker:
+    """
+    检查文本是否符合 StyleTemplate 定义的风格约束。
+
+    作用：refine 过程中，防止"越优化越不像原风格"。
+    最终得分 = objective_score - style_penalty
+
+    风格惩罚维度：
+    - lyric_density: 句长是否匹配 short/medium/long
+    - expression: 表达方式（direct 风格不能太文学，metaphor 不能太直白）
+    - imagery_penalty: 某些风格（如 emo/direct）不需要太多意象
+    """
+
+    # 直接风格（抖音伤感/说唱）：不宜过多意象词
+    DIRECT_EXPRESSION_KEYWORDS = ["忽然", "竟然", "原来", "却", "明明", "其实", "只是"]
+    METAPHOR_EXPRESSION_KEYWORDS = ["像", "如", "似", "仿佛", "如同"]
+
+    def penalty(self, text: str, style_template: StyleTemplate) -> float:
+        """
+        返回风格惩罚值（0.0 ~ 0.5）。
+
+        分越低 = 越符合风格约束。
+        目标：最终 score = objective_score - penalty
+        """
+        if style_template is None:
+            return 0.0
+
+        p = 0.0
+
+        # 1. lyric_density 惩罚
+        lines = [l.strip() for l in text.split("\n") if l.strip() and not l.startswith("【")]
+        if lines:
+            avg_len = sum(len(l) for l in lines) / len(lines)
+
+            if style_template.lyric_density == "short":
+                # short 风格：平均句长应 <= 8
+                if avg_len > 10:
+                    p += 0.15
+                elif avg_len > 8:
+                    p += 0.05
+            elif style_template.lyric_density == "long":
+                # long 风格：平均句长应 >= 8
+                if avg_len < 6:
+                    p += 0.15
+                elif avg_len < 8:
+                    p += 0.05
+
+        # 2. expression 惩罚
+        if style_template.expression == "direct":
+            # direct 风格：意象词过多 = 不够直接
+            metaphor_count = sum(1 for kw in self.METAPHOR_EXPRESSION_KEYWORDS if kw in text)
+            if metaphor_count >= 3:
+                p += 0.15
+            elif metaphor_count >= 2:
+                p += 0.08
+
+        elif style_template.expression == "metaphor":
+            # metaphor 风格：直白情绪词过多 = 意象不足
+            direct_count = sum(1 for kw in self.DIRECT_EXPRESSION_KEYWORDS if kw in text)
+            if direct_count >= 4:
+                p += 0.15
+            elif direct_count >= 2:
+                p += 0.08
+
+        # 3. Hook 相关惩罚（如果 template 指定了 hook_repeat）
+        hook_count = text.count("【Hook】")
+        if style_template.hook_repeat >= 2 and hook_count == 0:
+            p += 0.1  # 需要 Hook 但没有
+
+        # 4. Pre-Hook 惩罚
+        if style_template.pre_hook_enabled:
+            has_prehook = "【前Hook】" in text or "【Pre-Hook】" in text
+            if not has_prehook:
+                p += 0.05
+
+        return min(0.5, p)
+
+
 # ==================== 文本分析器 ====================
 
 class TextAnalyzer:
@@ -1041,53 +1285,253 @@ class TextAnalyzer:
         return issues
 
 
-# ==================== Refine Loop ====================
+# ==================== Refine Loop（操作空间搜索）====================
 
 class RefineLoop:
     """
-    针对 TextAnalyzer 检测出的问题，做局部重写。
+    基于操作空间搜索的 RefineLoop。
 
-    每次 refine 只改有问题的局部，不重写全篇。
+    核心变化：从"规则触发" → "搜索优化"
+
+    每次 refine 步骤：
+    1. 定义操作空间 OPS（每个 op 是生成候选项的 prompt 策略）
+    2. 对当前 text 应用每个 op（或采样），生成候选
+    3. 用 (objective_score - style_penalty) 对候选打分
+    4. 选择最优候选（贪心）；若无提升则保持原文本
+
+    这是一个贪心束搜索（Greedy Beam Search）：
+    - beam_width = 1（只保留最优）
+    - 若最优候选 < 当前，停止迭代
     """
+
+    # 操作空间定义：op_name → (description, min_issue)
+    # min_issue 表示该操作针对的问题
+    OPS = {
+        "rewrite_hook": {
+            "desc": "重写 Hook：强化记忆点、可复述性、情绪冲击",
+            "min_issue": "hook_weak",
+        },
+        "shorten_lines": {
+            "desc": "缩短句长：所有句压缩到 4-8 字",
+            "min_issue": "too_flat",
+        },
+        "lengthen_lines": {
+            "desc": "拉长句长：补充细节使句子更饱满",
+            "min_issue": None,
+        },
+        "add_imagery": {
+            "desc": "注入意象：补充具象视觉/听觉/触觉意象",
+            "min_issue": "no_imagery",
+        },
+        "increase_contrast": {
+            "desc": "增强反转：加入转折/对比结构",
+            "min_issue": None,
+        },
+        "simplify_language": {
+            "desc": "简化语言：去掉形容词，直接呈现",
+            "min_issue": None,
+        },
+        "fix_emotion_drift": {
+            "desc": "修复情绪漂移：强化情绪关键词，统一基调",
+            "min_issue": "emotion_drift",
+        },
+    }
 
     def __init__(self):
         self.analyzer = TextAnalyzer()
 
-    def refine(self, text: str, issues: dict,
+    def refine(self, text: str,
                style_template: StyleTemplate,
                emotion_vector: EmotionVector,
-               mode: GenerationMode) -> str:
+               mode: GenerationMode,
+               objective_fn: "ObjectiveFunction" = None,
+               style_checker: "StyleChecker" = None,
+               issues: dict = None,
+               beam_width: int = 2) -> tuple:
         """
-        根据 issues 字典，对文本做针对性局部改写。
-        返回改写后的文本。
+        束搜索多步 refine（beam_width >= 2）。
+
+        每次迭代：
+        1. 对当前 beam 中每个候选，应用所有相关 op 生成扩展候选
+        2. 用 (objective - penalty) 对所有候选打分
+        3. 保留 top beam_width
+
+        若 beam_width=1，退化为贪心搜索。
+
+        Returns:
+            (best_text, applied_op) - 最优候选和对其应用的操 作
         """
-        if not any(issues.values()):
-            return text
+        if objective_fn is None:
+            objective_fn = ObjectiveFunction(mode=mode)
+        if style_checker is None:
+            style_checker = StyleChecker()
 
-        refined = text
-
-        if issues.get("hook_weak"):
-            refined = self._refine_hook(refined, emotion_vector, style_template)
-
-        if issues.get("too_flat"):
-            refined = self._inject_variation(refined, emotion_vector, style_template, mode)
-
-        if issues.get("no_imagery"):
-            refined = self._inject_imagery(refined, emotion_vector, style_template)
-
-        if issues.get("emotion_drift"):
-            refined = self._fix_emotion_drift(refined, emotion_vector, style_template)
-
-        return refined
-
-    def _refine_hook(self, text: str,
-                     emotion_vector: EmotionVector,
-                     style_template: StyleTemplate) -> str:
-        """重写 Hook：强化记忆点、可复述性、情绪冲击"""
         primary, intensity = emotion_vector.get_primary()
         emotion_context = emotion_vector.to_prompt_context()
 
-        prompt = f"""以下歌词的 Hook 太弱，请改写为更有冲击力的核心记忆句。
+        # 初始化 beam：[(text, score, applied_op)]
+        initial_score = self._score_one(text, primary, mode, objective_fn, style_checker, style_template)
+        beam = [(text, initial_score, None)]
+
+        # 预分析 issues（全局，不变）
+        if issues is None:
+            issues = self.analyzer.analyze(text, mode, expected_emotion=primary)
+
+        relevant_ops = self._filter_ops(issues)
+        if not relevant_ops:
+            return text, None
+
+        # 束搜索迭代
+        for step in range(5):  # 最多5步
+            # 动态提议新操作（基于当前最优 beam 候选）
+            dynamic_ops = self._propose_ops(
+                beam[0][0], issues, emotion_context, style_template, mode
+            )
+
+            # 合并固定 ops + 动态 ops（动态 op 标记以便追踪）
+            all_ops = relevant_ops + [f"dyn:{op}" for op in dynamic_ops]
+
+            # 扩展所有 beam 候选
+            all_candidates = []
+            for beam_text, beam_score, _ in beam:
+                for op in all_ops:
+                    candidate = self._apply_op(op, beam_text, emotion_context, style_template, mode)
+                    if candidate and candidate != beam_text:
+                        cand_score = self._score_one(
+                            candidate, primary, mode, objective_fn, style_checker, style_template
+                        )
+                        all_candidates.append((candidate, cand_score, op))
+
+            if not all_candidates:
+                break
+
+            # 合并原 beam 一起排序
+            combined = beam + all_candidates
+            combined.sort(key=lambda x: x[1], reverse=True)
+            beam = combined[:beam_width]
+
+            # 若最优候选没有提升，停止
+            if beam[0][1] <= initial_score and step >= 1:
+                break
+
+        best_text, best_score, best_op = beam[0]
+        if best_text == text:
+            return text, None
+        return best_text, best_op
+
+    def _score_one(self, text: str, emotion: str, mode: GenerationMode,
+                    objective_fn, style_checker, style_template) -> float:
+        """对单条文本计算 composite score"""
+        hook = self._extract_hook_from_text(text)
+        obj = objective_fn.score_text(text, hook, emotion, mode)
+        penalty = style_checker.penalty(text, style_template)
+        return obj - penalty
+
+    def _filter_ops(self, issues: dict) -> list:
+        """根据 issues 过滤相关操作"""
+        relevant = []
+        for op_name, op_info in self.OPS.items():
+            min_issue = op_info["min_issue"]
+            if min_issue is None:
+                # 无特定问题要求的 op，每次都可以尝试
+                relevant.append(op_name)
+            elif issues.get(min_issue):
+                relevant.append(op_name)
+        return relevant
+
+    def _propose_ops(self, text: str, issues: dict,
+                      emotion_context: str,
+                      style_template: StyleTemplate,
+                      mode: GenerationMode) -> list:
+        """
+        用 LLM 动态提议新的操作（实验性）。
+
+        根据当前文本和问题，让 LLM 建议针对性的修改策略。
+        返回格式：[{"op": str, "description": str}, ...]
+        """
+        issue_summary = ", ".join([k for k, v in issues.items() if v]) or "无明显问题"
+        is_lyrics = mode == GenerationMode.LYRICS
+        type_hint = "歌词" if is_lyrics else "诗歌"
+
+        prompt = f"""以下{type_hint}存在以下问题：{issue_summary}
+
+原文本：
+{text}
+
+请建议 1-2 个针对性的修改操作（必须是具体、可执行的修改）：
+- 每个操作用一句话描述修改方向
+- 格式：操作名: 描述
+- 不要超过2个
+
+示例输出：
+add_repetition: 在第二句加入重复词增强节奏感
+insert_metaphor: 在第三行前加入一个意象比喻
+
+直接输出，不要解释："""
+
+        try:
+            result = llm(prompt, temp=0.8).strip()
+            ops = []
+            for line in result.split("\n"):
+                line = line.strip()
+                if ":" in line:
+                    op_name = line.split(":", 1)[0].strip()
+                    # 验证 op 名字不包含危险字符
+                    if op_name and len(op_name) < 30:
+                        ops.append(op_name)
+            return ops[:2]  # 最多2个动态操作
+        except Exception:
+            return []
+
+    def _apply_op(self, op: str, text: str,
+                  emotion_context: str,
+                  style_template: StyleTemplate,
+                  mode: GenerationMode) -> str:
+        """对当前文本应用指定操作"""
+        # 动态操作：dyn:op_name
+        if op.startswith("dyn:"):
+            dyn_op = op[4:]
+            return self._apply_dynamic_op(dyn_op, text, emotion_context, style_template, mode)
+
+        if mode == GenerationMode.LYRICS:
+            return self._apply_op_lyrics(op, text, emotion_context, style_template)
+        else:
+            return self._apply_op_poem(op, text, emotion_context, style_template)
+
+    def _apply_dynamic_op(self, op: str, text: str,
+                          emotion_context: str,
+                          style_template: StyleTemplate,
+                          mode: GenerationMode) -> str:
+        """
+        应用 LLM 动态提议的操作。
+        op 是操作名称（由 LLM 生成），我们将其作为修改指令。
+        """
+        is_lyrics = mode == GenerationMode.LYRICS
+        type_hint = "歌词" if is_lyrics else "诗歌"
+
+        prompt = f"""对以下{type_hint}执行修改操作：{op}
+
+原{type_hint}：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 只执行指定操作，不要大改
+- 保持原结构和其他部分不变
+- 直接输出修改后的完整{type_hint}，不要解释
+
+直接输出："""
+
+        try:
+            return llm(prompt, temp=0.7).strip()
+        except Exception:
+            return text
+
+    def _apply_op_lyrics(self, op: str, text: str,
+                         emotion_context: str,
+                         style_template: StyleTemplate) -> str:
+        prompts = {
+            "rewrite_hook": f"""以下歌词的 Hook 太弱，请改写为更有冲击力的核心记忆句。
 
 原歌词：
 {text}
@@ -1099,108 +1543,162 @@ class RefineLoop:
 - 保持其他部分不变，只改【Hook】部分
 - 格式：输出完整歌词
 
-直接输出完整歌词，不要解释："""
+直接输出完整歌词，不要解释：""",
 
-        try:
-            result = llm(prompt, temp=0.6).strip()
-            return result
-        except Exception:
-            return text
-
-    def _inject_variation(self, text: str,
-                          emotion_vector: EmotionVector,
-                          style_template: StyleTemplate,
-                          mode: GenerationMode) -> str:
-        """注入句式变化：调整句长多样性、开头词"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
-
-        if mode == GenerationMode.LYRICS:
-            prompt = f"""以下歌词句式太平，请改写增加变化。
+            "shorten_lines": f"""以下歌词句子太长，请压缩到 4-8 字每句，保持情绪不变。
 
 原歌词：
 {text}
 
 要求：
 - 情绪：{emotion_context}
-- 增加句长变化（有的短句3-5字，有的稍长8-12字）
-- 换不同的开头词（不要每句都用"我"/"你"/"其实"开头）
-- 加入转折词（却/但/只是/原来）增加层次
-- 保持情绪和结构不变，只调整句式
+- 每句压缩到 4-8 字
+- 保持原结构和情绪
+- 保持韵律感
 
-直接输出完整歌词，不要解释："""
-        else:
-            prompt = f"""以下诗歌句式太平，请改写增加变化。
+直接输出完整歌词，不要解释：""",
 
-原诗歌：
+            "lengthen_lines": f"""以下歌词句子太短，请适当补充细节，使每句 8-14 字。
+
+原歌词：
 {text}
 
 要求：
 - 情绪：{emotion_context}
-- 调整句长变化
-- 换不同开头词
-- 增加意象对比或反转
+- 适度扩展句长
+- 不要过度解释
 
-直接输出完整诗歌，不要解释："""
+直接输出完整歌词，不要解释：""",
 
-        try:
-            result = llm(prompt, temp=0.6).strip()
-            return result
-        except Exception:
-            return text
+            "increase_contrast": f"""以下歌词缺少反转和张力，请在适当位置加入转折句。
 
-    def _inject_imagery(self, text: str,
-                        emotion_vector: EmotionVector,
-                        style_template: StyleTemplate) -> str:
-        """注入意象：为诗歌补充意象词"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
-
-        prompt = f"""以下诗歌缺乏意象，请改写补充具象的视觉/听觉/触觉意象。
-
-原诗歌：
+原歌词：
 {text}
 
 要求：
 - 情绪：{emotion_context}
-- 在保留情绪的前提下，替换或增加具体意象（屏幕/雨/夜/光/影子/空/车站/街角等）
-- 不要直接说情绪，用意象呈现
-- 保持原结构，只补充意象
+- 加入对比或反转（却/但/只是/然而）
+- 保持整体结构
 
-直接输出完整诗歌，不要解释："""
+直接输出完整歌词，不要解释：""",
 
-        try:
-            result = llm(prompt, temp=0.6).strip()
-            return result
-        except Exception:
-            return text
+            "simplify_language": f"""以下歌词太文艺/啰嗦，请改为更直接、口语化的表达。
 
-    def _fix_emotion_drift(self, text: str,
-                            emotion_vector: EmotionVector,
-                            style_template: StyleTemplate) -> str:
-        """修复情绪漂移：强化情绪关键词"""
-        primary, intensity = emotion_vector.get_primary()
-        emotion_context = emotion_vector.to_prompt_context()
+原歌词：
+{text}
 
-        prompt = f"""以下歌词/诗歌的情绪不统一，请改写强化情绪一致性。
+要求：
+- 情绪：{emotion_context}
+- 直接说，不要绕
+- 保持情绪不变
 
-原文本：
+直接输出完整歌词，不要解释：""",
+
+            "fix_emotion_drift": f"""以下歌词情绪不统一，请改写强化情绪一致性。
+
+原歌词：
 {text}
 
 目标情绪：{emotion_context}
 
 要求：
 - 统一情绪基调
-- 增加情绪关键词密度
-- 不要偏离主情绪
+- 增加目标情绪关键词
 
-直接输出文本，不要解释："""
+直接输出完整歌词，不要解释：""",
+        }
+
+        prompt = prompts.get(op)
+        if not prompt:
+            return text
 
         try:
-            result = llm(prompt, temp=0.6).strip()
-            return result
+            return llm(prompt, temp=0.6).strip()
         except Exception:
             return text
+
+    def _apply_op_poem(self, op: str, text: str,
+                      emotion_context: str,
+                      style_template: StyleTemplate) -> str:
+        prompts = {
+            "rewrite_hook": f"""以下诗歌的结尾不够有力，请改写为更有冲击力的收束句。
+
+原诗歌：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 增强结尾的记忆点和情绪冲击
+- 保持原风格
+
+直接输出完整诗歌，不要解释：""",
+
+            "add_imagery": f"""以下诗歌缺乏意象，请改写补充具象的视觉/听觉/触觉意象。
+
+原诗歌：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 补充意象（屏幕/雨/夜/光/影子/空/车站/街角等）
+- 不要直接说情绪，用意象呈现
+
+直接输出完整诗歌，不要解释：""",
+
+            "increase_contrast": f"""以下诗歌缺少张力，请加入反转或对比结构。
+
+原诗歌：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 加入对比或反转
+
+直接输出完整诗歌，不要解释：""",
+
+            "simplify_language": f"""以下诗歌太复杂，请简化为更克制的表达。
+
+原诗歌：
+{text}
+
+要求：
+- 情绪：{emotion_context}
+- 简洁、克制
+- 不要过度修饰
+
+直接输出完整诗歌，不要解释：""",
+
+            "fix_emotion_drift": f"""以下诗歌情绪不统一，请改写强化情绪一致性。
+
+原诗歌：
+{text}
+
+目标情绪：{emotion_context}
+
+要求：
+- 统一情绪基调
+
+直接输出完整诗歌，不要解释：""",
+        }
+
+        prompt = prompts.get(op)
+        if not prompt:
+            return text
+
+        try:
+            return llm(prompt, temp=0.6).strip()
+        except Exception:
+            return text
+
+    def _extract_hook_from_text(self, text: str) -> str:
+        lines = text.split("\n")
+        for line in lines:
+            if "【Hook】" in line or "[Hook]" in line:
+                return line.replace("【Hook】", "").replace("[Hook]", "").strip()
+        non_empty = [l for l in lines if l.strip() and not l.startswith("【")]
+        if non_empty:
+            return non_empty[-1].strip()
+        return ""
 
 
 # ==================== 主入口 ====================
@@ -1241,6 +1739,8 @@ class EnhancedAgentOS:
         self.hook_optimizer = HookOptimizer()
         self.text_gen = TextGenerator(hook_optimizer=self.hook_optimizer)
         self.scorer = CandidateScorer()
+        self.objective_fn = ObjectiveFunction()
+        self.style_checker = StyleChecker()
         self.analyzer = TextAnalyzer()
         self.refine_loop = RefineLoop()
         self.gate = ExecutionGate()
@@ -1257,19 +1757,23 @@ class EnhancedAgentOS:
         """
         统一生成接口
 
-        Args:
-            content: 聊天记录（list）或 关键词（str）
-            mode: "lyrics" 或 "poem"
-            style: 风格名（如 "douyin_sad", "modern", None=自动检测）
-            constraints: 约束字典
-                - intensity: 情绪强度 0.0-1.0
-                - rhyme: 是否押韵（True/False）
-                - length: "short"/"medium"/"long"
-            num_candidates: 候选数量，默认3
-            humanize: 是否应用人类化改写，默认True
+        用户可控维度（通过 constraints）：
+            mode: "lyrics" | "poem"
+            style: "douyin_sad" | "rap" | "emo_pop" | "modern" | "classical" | "imagist" | "diary"
+            constraints:
+                - intensity: 情绪强度 0.0~1.0
+                - structure: 用户自定义 DSL（list[dict]），最高优先
+                - poem_form: "free" | "classical" | "imagist" | "diary"
+                - hook_strength: "strong" | "weak" | "none"（Hook 强度偏好）
+                - lyric_density: "short" | "medium" | "long"（句长风格）
+                - expression: "direct" | "metaphor" | "self_mock"（表达方式）
+                - weights: dict，自定义 ObjectiveFunction 权重
+                - beam_width: 束搜索宽度（默认2），越大保留路径越多
+                - max_refine_steps: 最大优化步数
+                - humanize_intensity: 人类化强度
 
         Returns:
-            GenerationResult: 包含主结果 + 候选列表
+            GenerationResult: 包含主结果 + 候选列表 + 创作解释
         """
         constraints = constraints or {}
         gen_mode = GenerationMode.LYRICS if mode == "lyrics" else GenerationMode.POEM
@@ -1290,6 +1794,35 @@ class EnhancedAgentOS:
         # 2. 解析风格
         style_template = self._resolve_style(style, gen_mode)
 
+        # 2.1 用 constraints 覆盖风格字段（用户可直接控制表达/句长）
+        if "expression" in constraints:
+            style_template.expression = constraints["expression"]
+        if "lyric_density" in constraints:
+            style_template.lyric_density = constraints["lyric_density"]
+        if "poem_form" in constraints:
+            style_template.poem_form = constraints["poem_form"]
+
+        # 2.2 目标函数（支持用户自定义权重）
+        custom_weights = constraints.get("weights")
+        objective_fn = ObjectiveFunction(mode=gen_mode, weights=custom_weights)
+
+        # 2.3 构建创作解释（初始部分）
+        primary_emotion, intensity = emotion_vector.get_primary()
+        creation_explanation = {
+            "emotion_arc": f"{primary_emotion} ({intensity:.1f})",
+            "style_decisions": {
+                "expression": style_template.expression,
+                "lyric_density": style_template.lyric_density,
+                "poem_form": getattr(style_template, 'poem_form', None),
+            },
+            "structure_type": style_template.name if style_template else "default",
+            "hook_strategy": self._describe_hook_strategy(style_template, constraints),
+            "objective_weights": custom_weights,
+            "optimization_steps": [],
+            "num_candidates": num_candidates,
+            "final_refine_steps": 0,
+        }
+
         # 3. 多候选生成
         candidates = []
         for i in range(num_candidates):
@@ -1308,27 +1841,49 @@ class EnhancedAgentOS:
         for ranked_entry in top_candidates:
             c = ranked_entry["result"]
             refine_steps = 0
+            step_records = []
             for step in range(max_refine_steps):
                 issues = self.analyzer.analyze(c["text"], gen_mode, expected_emotion=c.get("emotion"))
                 if not any(issues.values()):
                     break
-                c["text"] = self.refine_loop.refine(
-                    c["text"], issues, style_template, emotion_vector, gen_mode
+                c["text"], applied_op = self.refine_loop.refine(
+                    c["text"], style_template, emotion_vector, gen_mode,
+                    objective_fn=objective_fn,
+                    style_checker=self.style_checker,
+                    issues=issues,
+                    beam_width=constraints.get("beam_width", 2),
                 )
                 refine_steps += 1
+                step_records.append({
+                    "step": step,
+                    "issues": [k for k, v in issues.items() if v],
+                    "applied_op": applied_op,
+                })
             c["refinement_steps"] = refine_steps
+            c["step_records"] = step_records
             # Hook 可能已被改写，重新提取
             c["hook"] = self._extract_hook(c["text"], gen_mode)
+            # 记录最优候选的优化路径
+            if c is all_refine_candidates[0]:
+                creation_explanation["optimization_steps"] = step_records
+                creation_explanation["final_refine_steps"] = refine_steps
 
-        # 6. 重新排序（refine 后）
-        ranked_after_refine = self._rank(
-            [e["result"] for e in top_candidates] +
-            [e["result"] for e in ranked[2:]]
-        )
+        # 6. 重新排序（refine 后）使用 composite score = objective - penalty
+        all_refine_candidates = [e["result"] for e in top_candidates] + [e["result"] for e in ranked[2:]]
+        primary, _ = emotion_vector.get_primary()
+        for c in all_refine_candidates:
+            text = c.get("text", "")
+            hook = c.get("hook", "")
+            obj = objective_fn.score_text(text, hook, primary, gen_mode)
+            penalty = self.style_checker.penalty(text, style_template)
+            c["final_score"] = obj - penalty
+
+        all_refine_candidates.sort(key=lambda x: x["final_score"], reverse=True)
 
         # 7. 提取最优结果
-        best = ranked_after_refine[0]["result"]
-        best_score, best_details = ranked_after_refine[0]["score"], ranked_after_refine[0]["details"]
+        best = all_refine_candidates[0]
+        best_score = best.get("final_score", 0.0)
+        best_details = best.get("score_details", {})
 
         return GenerationResult(
             type=mode,
@@ -1343,6 +1898,7 @@ class EnhancedAgentOS:
             candidates=[self._to_result(c, mode) for c in candidates],
             refinement_steps=best.get("refinement_steps", 0),
             raw_text=best.get("raw_text", ""),
+            creation_explanation=creation_explanation,
         )
 
     def _generate_one(
@@ -1352,8 +1908,12 @@ class EnhancedAgentOS:
         """单次生成"""
         primary, intensity = emotion_vector.get_primary()
 
-        # 1. 生成 DSL
-        dsl = self.dsl_gen.generate(emotion_vector, mode, style_template)
+        # 1. 生成 DSL（支持用户自定义结构）
+        dsl = self.dsl_gen.generate(
+            emotion_vector, mode, style_template,
+            user_structure=constraints.get("structure"),
+            poem_form=constraints.get("poem_form"),
+        )
 
         # 2. 根据 DSL 生成文本
         text = self.text_gen.generate_from_dsl(dsl, style_template, emotion_vector, mode)
@@ -1439,6 +1999,40 @@ class EnhancedAgentOS:
                 setattr(ev, emotion, 0.1)
 
         return ev
+
+    def _composite_score(self, candidate: dict,
+                         style_template: StyleTemplate,
+                         mode: GenerationMode,
+                         emotion: str) -> float:
+        """
+        最终得分 = objective_score - style_penalty。
+        用于 refine 后排序。
+        """
+        text = candidate.get("text", "")
+        hook = candidate.get("hook", "")
+        obj_score = self.objective_fn.score_text(text, hook, emotion, mode)
+        penalty = self.style_checker.penalty(text, style_template)
+        return obj_score - penalty
+
+    def _describe_hook_strategy(self, style_template: StyleTemplate,
+                                 constraints: dict) -> str:
+        """描述 Hook 策略（用于创作解释）"""
+        hook_pref = constraints.get("hook_strength", "auto")
+        if hook_pref == "none":
+            return "无 Hook，纯叙述"
+        elif hook_pref == "weak":
+            return "弱 Hook，辅助叙事"
+        elif hook_pref == "strong":
+            return "强 Hook（反转+重复），强化记忆"
+        # auto: 从 style_template 推断
+        if style_template:
+            if style_template.hook_repeat >= 3:
+                return "洗脑 Hook（重复3次），高复述性"
+            elif style_template.expression == "direct":
+                return "反转 Hook，情绪冲击"
+            else:
+                return "意象 Hook，含蓄共鸣"
+        return "默认 Hook 策略"
 
     def _extract_hook(self, text: str, mode: GenerationMode) -> str:
         """从文本中提取 Hook"""

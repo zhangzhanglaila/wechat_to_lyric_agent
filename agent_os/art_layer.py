@@ -659,54 +659,75 @@ class StylePresetLibrary:
 @dataclass
 class StyleTemplate:
     """
-    v12.2 风格模板：控制歌曲的整体形态
+    v12.2 风格模板：歌词/诗歌统一控制协议
 
-    影响维度：
-    - bpm: 速度（快=说唱/emo，慢=伤感/民谣）
-    - hook_repeat: Hook重复次数（2=普通，3=洗脑）
-    - lyric_density: 歌词密度（短句=抖音/说唱，长句=周董/民谣）
-    - expression: 表达方式（直接/含蓄/自嘲）
+    通用字段（歌词+诗歌）：
+    - name: 风格名称
+    - lyric_density: 歌词密度（"short" / "medium" / "long"）
+    - expression: 表达方式（"direct" / "metaphor" / "self_mock"）
+
+    歌词专用字段：
+    - bpm: 速度
+    - hook_repeat: Hook重复次数
+    - pre_hook_enabled: 是否有Pre-Hook铺垫
+    - melody_pattern: "jump" / "smooth" / "flat"
+
+    诗歌专用字段：
+    - poem_form: 诗歌体裁（"free" / "classical" / "imagist" / "diary"）
+    - min_lines: 最少行数
+    - max_lines: 最多行数
     """
     name: str
-    bpm: int
-    hook_repeat: int         # Hook重复次数
     lyric_density: str       # "short" / "medium" / "long"
     expression: str         # "direct" / "metaphor" / "self_mock"
-    pre_hook_enabled: bool   # 是否有Pre-Hook铺垫
-    melody_pattern: str      # "jump" / "smooth" / "flat"
+    # 歌词专用
+    bpm: int = 80
+    hook_repeat: int = 2
+    pre_hook_enabled: bool = True
+    melody_pattern: str = "smooth"
+    # 诗歌专用
+    poem_form: str = "free"
+    min_lines: int = 4
+    max_lines: int = 12
 
 
 # v12.2 风格 → 模板映射
 STYLE_TEMPLATES = {
     StylePreset.DOUYIN_SAD: StyleTemplate(
-        name="抖音伤感", bpm=90, hook_repeat=3,
+        name="抖音伤感",
         lyric_density="short", expression="direct",
-        pre_hook_enabled=True, melody_pattern="jump"
+        bpm=90, hook_repeat=3,
+        pre_hook_enabled=True, melody_pattern="jump",
     ),
     StylePreset.RAP: StyleTemplate(
-        name="说唱", bpm=140, hook_repeat=2,
+        name="说唱",
         lyric_density="short", expression="direct",
-        pre_hook_enabled=False, melody_pattern="jump"
+        bpm=140, hook_repeat=2,
+        pre_hook_enabled=False, melody_pattern="jump",
     ),
     StylePreset.EMO_POP: StyleTemplate(
-        name="Emo流行", bpm=110, hook_repeat=3,
+        name="Emo流行",
         lyric_density="short", expression="self_mock",
-        pre_hook_enabled=True, melody_pattern="flat"
+        bpm=110, hook_repeat=3,
+        pre_hook_enabled=True, melody_pattern="flat",
     ),
     StylePreset.HEARTBREAK: StyleTemplate(
-        name="失恋", bpm=75, hook_repeat=2,
+        name="失恋",
         lyric_density="medium", expression="metaphor",
-        pre_hook_enabled=True, melody_pattern="smooth"
+        bpm=75, hook_repeat=2,
+        pre_hook_enabled=True, melody_pattern="smooth",
     ),
     StylePreset.FOLK: StyleTemplate(
-        name="民谣", bpm=80, hook_repeat=2,
+        name="民谣",
         lyric_density="long", expression="direct",
-        pre_hook_enabled=False, melody_pattern="smooth"
+        bpm=80, hook_repeat=2,
+        pre_hook_enabled=False, melody_pattern="smooth",
     ),
     StylePreset.JAY_CHOU: StyleTemplate(
-        name="周杰伦", bpm=85, hook_repeat=2,
+        name="周杰伦",
         lyric_density="medium", expression="metaphor",
-        pre_hook_enabled=False, melody_pattern="jump"
+        bpm=85, hook_repeat=2,
+        pre_hook_enabled=False, melody_pattern="jump",
     ),
 }
 
