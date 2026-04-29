@@ -14,6 +14,8 @@ import json
 import time
 import asyncio
 import threading
+import logging
+import uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from agent_os.integration import (
@@ -25,6 +27,9 @@ from agent_os.art_layer import llm_stream
 
 _EOS = None
 _EOS_LOCK = threading.Lock()
+FAST_PATH_TIMEOUT_SECONDS = float(os.getenv("FAST_PATH_TIMEOUT_SECONDS", "60"))
+ADVANCED_PATH_TIMEOUT_SECONDS = float(os.getenv("ADVANCED_PATH_TIMEOUT_SECONDS", "240"))
+logger = logging.getLogger(__name__)
 
 
 def _get_eos() -> EnhancedAgentOS:
@@ -165,12 +170,28 @@ def _score_text(text: str, hook: str, mode: str) -> tuple:
         return 0.0, {}
 
 
-async def _stream_fast_generate(req, constraints: dict):
+def _log_generation(request_id: str, status: str, **fields):
+    logger.info(json.dumps({
+        "event": "generation",
+        "request_id": request_id,
+        "status": status,
+        **fields,
+    }, ensure_ascii=False))
+
+
+async def _stream_fast_generate(req, constraints: dict, request_id: str):
     t0 = time.time()
 
     def emit(step, msg, data=None):
-        return _emit(step, msg, data, time.time() - t0)
+        payload = data.copy() if isinstance(data, dict) else data
+        if isinstance(payload, dict):
+            payload["request_id"] = request_id
+        return _emit(step, msg, payload, time.time() - t0)
 
+    _log_generation(
+        request_id, "started",
+        path="fast", mode=req.mode, style=req.style, timeout=FAST_PATH_TIMEOUT_SECONDS,
+    )
     yield emit("prompt", "构造 prompt", {
         "mode": "fast",
         "style": _style_label(req.style, req.mode),
@@ -184,23 +205,66 @@ async def _stream_fast_generate(req, constraints: dict):
     yield emit("llm", "LLM 流式生成中...", None)
     await asyncio.sleep(0)
 
-    async for token in llm_stream(prompt, temp=0.75):
-        if first_token_at is None:
-            first_token_at = time.time() - t0
-        text_chunks.append(token)
-        yield _emit("token", "", {
-            "candidate_index": 1,
-            "total": 1,
-            "partial_text": "".join(text_chunks),
-            "first_token": round(first_token_at, 2),
-        }, time.time() - t0)
-        await asyncio.sleep(0)
+    try:
+        async with asyncio.timeout(FAST_PATH_TIMEOUT_SECONDS):
+            async for token in llm_stream(prompt, temp=0.75):
+                if first_token_at is None:
+                    first_token_at = time.time() - t0
+                    _log_generation(
+                        request_id, "first_token",
+                        path="fast", first_token=round(first_token_at, 2),
+                    )
+                if token.startswith("LLM Error:"):
+                    raise RuntimeError(token)
+                text_chunks.append(token)
+                yield _emit("token", "", {
+                    "request_id": request_id,
+                    "candidate_index": 1,
+                    "total": 1,
+                    "partial_text": "".join(text_chunks),
+                    "first_token": round(first_token_at, 2),
+                }, time.time() - t0)
+                await asyncio.sleep(0)
+    except TimeoutError:
+        elapsed = time.time() - t0
+        _log_generation(
+            request_id, "timeout",
+            path="fast", elapsed=round(elapsed, 2), timeout=FAST_PATH_TIMEOUT_SECONDS,
+        )
+        yield _emit("error", f"生成超时（{int(FAST_PATH_TIMEOUT_SECONDS)}s），请稍后重试或缩短输入。", {
+            "request_id": request_id,
+            "code": "GENERATION_TIMEOUT",
+            "elapsed": round(elapsed, 2),
+        }, elapsed)
+        return
+    except Exception as e:
+        elapsed = time.time() - t0
+        _log_generation(
+            request_id, "failed",
+            path="fast", elapsed=round(elapsed, 2), error=str(e),
+        )
+        yield _emit("error", f"LLM 调用失败: {e}", {
+            "request_id": request_id,
+            "code": "LLM_ERROR",
+            "elapsed": round(elapsed, 2),
+        }, elapsed)
+        return
 
     text = "".join(text_chunks).strip()
     hook = _extract_hook_text(text)
     score, details = _score_text(text, hook, req.mode)
+    total_elapsed = time.time() - t0
+    _log_generation(
+        request_id, "completed",
+        path="fast",
+        first_token=round(first_token_at or 0.0, 2),
+        total_elapsed=round(total_elapsed, 2),
+        llm_calls=1,
+        output_chars=len(text),
+    )
 
     yield emit("final", "生成完成", {
+        "request_id": request_id,
         "mode": req.mode,
         "path": "fast",
         "style": _style_label(req.style, req.mode),
@@ -232,8 +296,9 @@ async def _stream_fast_generate(req, constraints: dict):
             {"index": 1, "text": text, "score": score, "hook": hook}
         ],
         "observability": {
+            "request_id": request_id,
             "first_token": round(first_token_at or 0.0, 2),
-            "total_elapsed": round(time.time() - t0, 2),
+            "total_elapsed": round(total_elapsed, 2),
             "llm_calls": 1,
         },
     })
@@ -422,19 +487,30 @@ async def stream_generate_async(req):
     5. final
     """
     t0 = time.time()
+    request_id = uuid.uuid4().hex[:12]
 
     def emit(step, msg, data=None):
-        return _emit(step, msg, data, time.time() - t0)
+        payload = data.copy() if isinstance(data, dict) else data
+        if isinstance(payload, dict):
+            payload["request_id"] = request_id
+        return _emit(step, msg, payload, time.time() - t0)
 
     try:
         gen_mode = GenerationMode.LYRICS if req.mode == "lyrics" else GenerationMode.POEM
         constraints = _build_constraints(req)
 
         if not getattr(req, "advanced_mode", False):
-            async for evt in _stream_fast_generate(req, constraints):
+            async for evt in _stream_fast_generate(req, constraints, request_id):
                 yield evt
             return
 
+        _log_generation(
+            request_id, "started",
+            path="advanced", mode=req.mode, style=req.style,
+            timeout=ADVANCED_PATH_TIMEOUT_SECONDS,
+            candidates=min(req.candidates, 3),
+            max_refine_steps=constraints.get("max_refine_steps", 0),
+        )
         eos = _get_eos()
 
         # ===== Step 1: parse =====
@@ -502,6 +578,21 @@ async def stream_generate_async(req):
         candidate_results = [None] * num_candidates
 
         while pending:
+            if time.time() - t0 > ADVANCED_PATH_TIMEOUT_SECONDS:
+                elapsed = time.time() - t0
+                for task in pending:
+                    task.cancel()
+                _log_generation(
+                    request_id, "timeout",
+                    path="advanced", elapsed=round(elapsed, 2),
+                    timeout=ADVANCED_PATH_TIMEOUT_SECONDS,
+                )
+                yield _emit("error", f"高级模式生成超时（{int(ADVANCED_PATH_TIMEOUT_SECONDS)}s），请减少候选数或切回 Simple Mode。", {
+                    "request_id": request_id,
+                    "code": "GENERATION_TIMEOUT",
+                    "elapsed": round(elapsed, 2),
+                }, elapsed)
+                return
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for finished_task in done:
                 try:
@@ -568,8 +659,17 @@ async def stream_generate_async(req):
         _, opt_details = scorer.score(best) if best else (0.0, {})
 
         # ===== Step 6: 最终结果 =====
+        total_elapsed = time.time() - t0
+        _log_generation(
+            request_id, "completed",
+            path="advanced",
+            total_elapsed=round(total_elapsed, 2),
+            candidates=len(candidate_results),
+        )
         yield emit("final", "创作完成", {
+            "request_id": request_id,
             "mode": req.mode,
+            "path": "advanced",
             "style": style_template.name if style_template else "default",
             "emotion": best.get("emotion", primary_emotion) if best else primary_emotion,
             "emotion_intensity": best.get("emotion_intensity", intensity) if best else intensity,
@@ -604,12 +704,23 @@ async def stream_generate_async(req):
                 }
                 for i, c in enumerate(candidate_results)
             ],
+            "observability": {
+                "request_id": request_id,
+                "total_elapsed": round(total_elapsed, 2),
+                "llm_calls": len(candidate_results),
+            },
         })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield _emit("error", f"生成失败: {e}", None, time.time() - t0)
+        elapsed = time.time() - t0
+        _log_generation(request_id, "failed", elapsed=round(elapsed, 2), error=str(e))
+        yield _emit("error", f"生成失败: {e}", {
+            "request_id": request_id,
+            "code": "GENERATION_ERROR",
+            "elapsed": round(elapsed, 2),
+        }, elapsed)
 
 
 def _run_baseline_sync(eos, text, mode, style, constraints, gen_mode, style_template, emotion_vector, dsl):

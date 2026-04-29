@@ -1,179 +1,284 @@
 # GenWriter Agent
 
-**A controllable lyric & poetry generation system powered by LLM + search optimization.**
+一个中文歌词 / 诗歌生成系统，核心目标不是堆复杂 pipeline，而是提供一个**默认可用、响应快、可观测**的 LLM 创作服务。
 
-把聊天记录 / 关键词 / 情绪，自动变成一首有感染力的歌词或诗歌。
+当前架构是双模式：
 
-> 本质：将文本创作建模为 **搜索问题**，通过 DSL 约束 + 候选生成 + 束搜索优化，实现可控的歌词与诗歌生成。
+- **简易模式 Simple Mode**：默认路径，单次 LLM + SSE 流式返回，优先保证响应速度和用户体验。
+- **高级模式 Advanced Mode**：可选路径，保留 Emotion → DSL → Generate → Rank → Refine 的多阶段优化链，适合研究和高质量生成。
+
+---
+
+## 功能特性
+
+### 简易模式（默认）
+
+- 快速生成，目标约 10-20 秒内完成
+- 单次 LLM 调用
+- SSE 流式输出，前端实时显示 token
+- Prompt 强约束输入主题，减少跑偏
+- 适合大多数用户和演示场景
+
+### 高级模式（可选）
+
+- 多阶段 pipeline：Emotion → DSL → Generate → Rank → Refine
+- 支持多候选、重排、一次精修
+- 更可控，但更慢，通常约 60-200 秒
+- 适合研究、对比实验和高级用户
 
 ---
 
 ## 架构
 
+```text
+Client (Vue)
+  ↓ SSE
+Backend (FastAPI)
+  ├─ Simple Mode（默认）
+  │   └─ Prompt 构造 → 单次 LLM Streaming → 实时返回
+  │
+  ├─ Advanced Mode（可选）
+  │   └─ Emotion → DSL → 多候选生成 → Rank → Refine
+  │
+  └─ Observability
+      ├─ step events
+      ├─ token stream
+      ├─ elapsed latency
+      └─ score / candidates
 ```
-User Input
-    ↓
-Emotion Modeling
-    ↓
-DSL (User Editable)  ← 用户可编辑结构
-    ↓
-Constrained Generation (N candidates)
-    ↓
-Hook Optimization (multi-variant + scoring)
-    ↓
-Beam Search Refinement (LLM + ops space)
-    ↓
-Final Output + Creation Explanation
-```
+
+默认请求不会进入 AgentOS 复杂链路；只有显式开启 `advanced_mode` 才会走高级 pipeline。
 
 ---
 
-## 核心能力
+## 使用方式
 
-### 双模式生成
+### 1. 启动后端
 
 ```bash
-# 歌词模式
-python chat2lyric_agent.py --input chat.txt --mode lyrics --style douyin_sad
-
-# 诗歌模式
-python chat2lyric_agent.py --input keywords.txt --mode poem --style modern
+python -m backend.main
 ```
 
-### 用户可控维度
+默认服务地址：
 
-| 维度 | 选项 |
-|------|------|
-| `mode` | `lyrics` / `poem` |
-| `style` | `douyin_sad` `rap` `emo_pop` `modern` `classical` `imagist` `diary` |
-| `expression` | `direct` / `metaphor` / `self_mock` |
-| `lyric_density` | `short` / `medium` / `long` |
-| `intensity` | 0.0 ~ 1.0 |
-| `beam_width` | 2 ~ 4（越大优化路径越多） |
-| `weights` | 自定义目标函数权重 |
-
-### DSL 外显（用户可编辑结构）
-
-```python
-structure = [
-    {"section": "intro",   "intent": "场景设定"},
-    {"section": "verse",   "intent": "叙述关系变化"},
-    {"section": "hook",    "intent": "核心记忆点"},
-]
-result = eos.generate(content, mode="lyrics", constraints={"structure": structure})
+```text
+http://localhost:8000
 ```
 
----
+接口文档：
 
-## Baseline 对比
+```text
+http://localhost:8000/docs
+```
 
-用 `--baseline` 开关对比"无优化链的原始生成" vs "完整管线"：
+### 2. 启动前端
 
 ```bash
-python chat2lyric_agent.py --input chat.txt --mode lyrics --baseline --explain
+cd frontend
+npm install
+npm run dev
 ```
 
-输出示例：
-
-```
-========================================================
-  Baseline（无优化链的原始 LLM 生成）
-========================================================
-
-【歌词】
-...（较差的结果）
-
-========================================================
-  优化后（完整管线）
-========================================================
-
-【歌词】
-...（明显更好的结果）
-
-【对比】Baseline 0.31  ↑  System 0.79  (Δ +0.48)
-```
+前端默认进入简易模式，可以在控制面板中切换到高级模式。
 
 ---
 
-## 创作说明（可解释）
+## API 示例
 
-加 `--explain` 开关，输出创作过程：
+实际接口前缀是 `/api`。
 
-```bash
-python chat2lyric_agent.py --input keywords.txt --mode poem --explain
+### 默认：简易模式
+
+```http
+POST /api/generate/stream
+Content-Type: application/json
 ```
 
+```json
+{
+  "text": "我是你爸爸",
+  "mode": "lyrics",
+  "style": "rap"
+}
 ```
-【创作说明】
-------------------------------------------------------------
-  情绪演化  : sadness (0.8)
-  表达方式  : direct
-  句长风格  : short
-  Hook策略  : 洗脑 Hook（重复3次），高复述性
-  优化步数  : 3
-  ──────────────────
-    Step 1: [hook_weak] → rewrite_hook
-    Step 2: [too_flat] → shorten_lines
-    Step 3: [no_imagery] → add_imagery
 
-【分数】
-  Total   : 0.79
-  ─────   : ──────
-  hook_strength    : ████████░░ 0.82
-  lyric_variation  : ██████░░░░ 0.61
-  emotion_consistency: ███████░░░ 0.71
-  singability      : ██████░░░░ 0.58
+特点：
+
+- `advanced_mode` 默认为 `false`
+- 单次 LLM 调用
+- 通过 SSE 持续返回 `token` 事件
+
+### 高级模式
+
+```http
+POST /api/generate/stream
+Content-Type: application/json
 ```
+
+```json
+{
+  "text": "我是你爸爸",
+  "mode": "lyrics",
+  "style": "rap",
+  "advanced_mode": true,
+  "candidates": 3,
+  "max_refine_steps": 1,
+  "beam_width": 2
+}
+```
+
+特点：
+
+- 会进入 AgentOS 多阶段链路
+- 支持多候选、评分、排序、精修
+- 延迟和成本明显高于简易模式
+
+### 同步接口
+
+```http
+POST /api/generate
+Content-Type: application/json
+```
+
+请求体与 `/api/generate/stream` 相同，但不会逐 token 返回，适合脚本调用。
 
 ---
 
-## 完整示例
+## 前端模式切换
 
-```bash
-python chat2lyric_agent.py \
-  --input "思念 远方的你 分手" \
-  --mode lyrics \
-  --style douyin_sad \
-  --intensity 0.8 \
-  --candidates 3 \
-  --beam-width 2 \
-  --explain \
-  --show-candidates \
-  --baseline
+控制面板中提供两个模式：
+
+```text
+[ Simple Mode ⚡ ]   [ Advanced Mode ]
 ```
+
+### Simple Mode
+
+- 默认开启
+- 秒级反馈
+- 实时显示生成中的正文
+- 隐藏候选数、beam width、refine 等复杂参数
+
+### Advanced Mode
+
+- 手动开启
+- 展示候选数、beam width、最大优化步数
+- 适合需要更高质量或想观察 pipeline 的场景
 
 ---
 
-## 文件结构
+## Prompt 策略
 
+简易模式使用强约束 prompt：
+
+```text
+你是一个专业中文歌词创作助手。
+
+【输入主题】
+{user_input}
+
+【硬性要求】
+- 必须围绕输入语义，不得偏离
+- 风格：{style}
+- 语言：口语化、有节奏感
+- 禁止无故生成伤感情歌
+- 不要输出解释、分析、前言
+
+【结构】
+【开场】
+【主歌】
+【Hook】
+
+【输出】
+直接输出正文
 ```
+
+这样可以避免模型默认滑向“伤感情歌”等高频分布。
+
+---
+
+## 性能目标
+
+| 指标 | 目标 |
+|---|---|
+| 首 token | 尽量 < 2 秒 |
+| 简易模式完整生成 | 约 10-20 秒 |
+| 默认 LLM 调用次数 | 1 |
+| UI 响应 | token 实时展示 |
+| 高级模式完整生成 | 约 60-200 秒 |
+
+实际延迟取决于模型服务、网络和输出长度。
+
+---
+
+## 超时与可观测性
+
+后端会为每次生成创建 `request_id`，并在 SSE 事件、最终响应和日志中透出，便于排查问题。
+
+默认超时配置：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---:|---|
+| `FAST_PATH_TIMEOUT_SECONDS` | `60` | Simple Mode 总超时 |
+| `ADVANCED_PATH_TIMEOUT_SECONDS` | `240` | Advanced Mode 总超时 |
+
+日志为结构化 JSON，包含：
+
+```json
+{
+  "event": "generation",
+  "request_id": "a1b2c3d4e5f6",
+  "status": "completed",
+  "path": "fast",
+  "first_token": 1.42,
+  "total_elapsed": 8.76,
+  "llm_calls": 1
+}
+```
+
+前端在失败或超时时会展示明确错误和 `Request ID`，不会一直停留在“生成中”。
+
+---
+
+## 主要文件
+
+```text
+backend/
+  main.py                  # FastAPI 入口
+  api/generate.py          # /api/generate 与 /api/generate/stream
+  services/generator.py    # Simple Mode + Advanced Mode 调度
+  schemas/generate.py      # 请求 / 响应 schema
+
+frontend/
+  src/App.vue              # 主 UI，模式切换与 SSE 消费
+  src/components/
+    LivePipeline.vue       # 步骤与耗时展示
+    ResultComparison.vue   # 结果展示
+    ExplanationPanel.vue   # 创作说明
+
 agent_os/
-  art_layer.py      # EmotionEngine / HookGenerator / StyleTemplate / NarrativeBuilder
-  integration.py   # EnhancedAgentOS / HookOptimizer / TextAnalyzer /
-                   # RefineLoop(beam search) / ObjectiveFunction / StyleChecker
-chat2lyric_agent.py  # CLI 入口
-requirements.txt
+  art_layer.py             # LLM streaming、风格模板、艺术层工具
+  integration.py           # Advanced Mode 的 AgentOS pipeline
 ```
 
 ---
 
-## 依赖
+## 设计取舍
 
-```
-openai>=1.0.0
-python-dotenv>=1.0.0
-```
+本项目不把复杂度放在默认路径里。
 
----
+默认路径追求：
 
-## 核心设计思想
+- 稳定
+- 快
+- 可观测
+- 用户能看到实时反馈
 
-本项目的本质是 **Iterative Structured Generation System**：
+高级路径保留：
 
-1. **Emotion → DSL**：情绪向量生成结构化意图
-2. **DSL → 强约束生成**：每行按 intent + section 约束生成，而非自由发挥
-3. **多候选 + HookOptimizer**：生成多个 Hook 变体，评分选最优
-4. **Beam Search Refine**：多步束搜索，动态 LLM 提议操作
-5. **Objective - Penalty**：目标函数驱动的优化，风格一致性约束
+- 多候选
+- rerank
+- refine
+- DSL / Emotion pipeline
 
-这使得系统从"调 API 生成工具"进化为"可控创作 Agent"。
+这对应真实工程中的取舍：**fast path 服务大多数请求，slow path 作为可选增强能力。**

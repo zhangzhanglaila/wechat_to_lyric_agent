@@ -121,11 +121,30 @@
               </select>
             </div>
 
-            <label class="flex items-center gap-2.5 cursor-pointer py-1">
-              <input type="checkbox" v-model="advancedMode"
-                     class="w-4 h-4 rounded border-border-light bg-gray-50 text-bilibili-blue focus:ring-bilibili-blue/30" />
-              <span class="text-sm text-text-secondary">优化模式（多候选 / rerank / refine）</span>
-            </label>
+            <div>
+              <label class="text-xs text-text-tertiary mb-1.5 block">生成模式</label>
+              <div class="grid grid-cols-2 rounded-lg border border-border-light bg-gray-50 p-1">
+                <button
+                  type="button"
+                  @click="advancedMode = false"
+                  class="rounded-md px-3 py-2 text-xs font-semibold transition-colors"
+                  :class="!advancedMode ? 'bg-white text-bilibili-blue shadow-sm' : 'text-text-tertiary hover:text-text-secondary'"
+                >
+                  Simple Mode ⚡
+                </button>
+                <button
+                  type="button"
+                  @click="advancedMode = true"
+                  class="rounded-md px-3 py-2 text-xs font-semibold transition-colors"
+                  :class="advancedMode ? 'bg-white text-bilibili-pink shadow-sm' : 'text-text-tertiary hover:text-text-secondary'"
+                >
+                  Advanced Mode
+                </button>
+              </div>
+              <p class="mt-1.5 text-xs text-text-tertiary">
+                {{ advancedMode ? '高质量生成：多候选、重排、精修，耗时更长。' : '默认简易模式：单次 LLM，优先实时反馈。' }}
+              </p>
+            </div>
 
             <!-- Sliders row -->
             <div class="grid grid-cols-2 gap-4">
@@ -178,6 +197,13 @@
 
         <!-- Pipeline Live View -->
         <LivePipeline v-if="loading || pipelineSteps.length > 0" :steps="pipelineSteps" />
+
+        <div v-if="errorMessage"
+             class="bg-red-50 border border-red-200 rounded-2xl p-4 text-sm text-red-600">
+          <div class="font-semibold mb-1">生成失败</div>
+          <div>{{ errorMessage }}</div>
+          <div v-if="requestId" class="mt-2 text-xs text-red-400">Request ID: {{ requestId }}</div>
+        </div>
 
         <div v-if="loading || streamingText"
              class="bg-white rounded-2xl shadow-card p-5 border border-border-light">
@@ -240,6 +266,8 @@ const loading = ref(false)
 const pipelineSteps = ref([])
 const result = ref(null)
 const streamingText = ref('')
+const errorMessage = ref('')
+const requestId = ref('')
 const elapsedSeconds = ref(0)
 let elapsedTimer = null
 const llmStatus = ref('unknown')
@@ -274,6 +302,8 @@ async function generate() {
   pipelineSteps.value = []
   result.value = null
   streamingText.value = ''
+  errorMessage.value = ''
+  requestId.value = ''
   elapsedSeconds.value = 0
   const startedAt = performance.now()
   elapsedTimer = window.setInterval(() => {
@@ -322,34 +352,48 @@ async function generate() {
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue
+        let evt
         try {
-          const evt = JSON.parse(line.slice(6))
-          if (evt.step === 'error') throw new Error(evt.msg)
-          if (evt.step === 'token') {
-            streamingText.value = evt.data?.partial_text || streamingText.value
-          }
-
-          // 分发步骤（去重更新）
-          const existing = pipelineSteps.value.findIndex(
-            s => s.step === evt.step && (evt.data?.candidate === undefined || s.data?.candidate === evt.data?.candidate)
-          )
-          if (existing >= 0) {
-            pipelineSteps.value[existing] = evt
-          } else {
-            pipelineSteps.value.push(evt)
-          }
-
-          if (evt.step === 'final') {
-            result.value = evt.data
-            streamingText.value = evt.data?.optimized_text || streamingText.value
-          }
+          evt = JSON.parse(line.slice(6))
         } catch (parseErr) {
           if (parseErr.message !== '') console.warn('Parse error:', parseErr)
+          continue
+        }
+
+        if (evt.data?.request_id) {
+          requestId.value = evt.data.request_id
+        }
+
+        // 分发步骤（去重更新）
+        const existing = pipelineSteps.value.findIndex(
+          s => s.step === evt.step && (evt.data?.candidate === undefined || s.data?.candidate === evt.data?.candidate)
+        )
+        if (existing >= 0) {
+          pipelineSteps.value[existing] = evt
+        } else {
+          pipelineSteps.value.push(evt)
+        }
+
+        if (evt.step === 'error') {
+          errorMessage.value = evt.msg || '生成失败'
+          loading.value = false
+          try { await reader.cancel() } catch {}
+          return
+        }
+
+        if (evt.step === 'token') {
+          streamingText.value = evt.data?.partial_text || streamingText.value
+        }
+
+        if (evt.step === 'final') {
+          result.value = evt.data
+          streamingText.value = evt.data?.optimized_text || streamingText.value
         }
       }
     }
   } catch (err) {
     console.error('Generate failed:', err)
+    errorMessage.value = err.message
     pipelineSteps.value.push({ step: 'error', msg: '生成失败: ' + err.message })
   } finally {
     loading.value = false
