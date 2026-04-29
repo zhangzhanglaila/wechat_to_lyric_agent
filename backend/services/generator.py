@@ -3,11 +3,8 @@ Generator Service - 企业级高性能歌词/诗歌生成
 
 架构原则：
 - 单次 LLM 生成（不是几十次）
-- 并发多候选（不是串行）
-- 本地打分（不调用 LLM）
-- 最多一次 refine
 - SSE 每步实时推送，携带丰富内容
-- 每个候选完成时立即 yield（as_completed 模式）
+- Token 实时流式输出（async generator 直连 HTTP）
 
 目标：< 15s 出结果，用户实时可见每一步
 """
@@ -16,6 +13,7 @@ import os
 import json
 import time
 import asyncio
+import queue
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from agent_os.integration import (
@@ -42,7 +40,7 @@ def _safe_score(eos, candidate) -> float:
 def _build_constraints(req) -> dict:
     constraints = {
         "beam_width": req.beam_width,
-        "max_refine_steps": min(req.max_refine_steps, 1),  # 最多1次
+        "max_refine_steps": min(req.max_refine_steps, 1),
     }
     if req.intensity is not None:
         constraints["intensity"] = req.intensity
@@ -59,40 +57,71 @@ def _build_constraints(req) -> dict:
     return constraints
 
 
+def _emit(step: str, msg: str, data, elapsed: float) -> dict:
+    """创建事件 dict（直接 yield，无需回调）"""
+    payload = {"step": step, "msg": msg, "elapsed": round(elapsed, 2)}
+    if data is not None:
+        payload["data"] = data
+    return payload
+
+
 # ==================== 核心生成逻辑 ====================
 
 async def _gen_single_candidate(
     idx: int,
     eos, emotion_vector, gen_mode, style_template, constraints, dsl,
-    on_token=None,
-) -> tuple:
+):
     """
-    生成单个候选，返回 (idx, candidate_dict)。
+    生成单个候选。是一个 async generator，yield 第一个 token 时通知主循环开始监听。
 
     每个候选独立，不依赖其他候选。
-    on_token 不为 None 时，每生成一个 token 就调用它（打字机效果）。
     """
     primary, intensity = emotion_vector.get_primary()
 
-    # 流式生成歌词/诗歌：async for 驱动 token 实时推送
+    # 用于 token 队列（跨线程安全）
+    token_q: asyncio.Queue = asyncio.Queue()
     text_chunks = []
+    done_event = asyncio.Event()
 
-    def _handle_token(token):
+    def _on_token(token):
+        """同步回调：把 token 放入队列（在 LLM 线程中调用）"""
         text_chunks.append(token)
-        if on_token is not None:
-            on_token(token)
+        try:
+            token_q.put_nowait(token)
+        except queue.Full:
+            pass
 
-    if gen_mode == GenerationMode.LYRICS:
-        # async for 驱动 llm_stream 异步迭代，_handle_token 实时被调用
-        async for _ in eos.text_gen.generate_from_dsl_streaming(
-            dsl, style_template, emotion_vector, gen_mode, _handle_token,
-        ):
-            pass
-    else:
-        async for _ in eos.text_gen.generate_poem_streaming(
-            dsl, style_template, emotion_vector, _handle_token,
-        ):
-            pass
+    # 启动后台生成协程
+    async def _generate():
+        try:
+            if gen_mode == GenerationMode.LYRICS:
+                async for _ in eos.text_gen.generate_from_dsl_streaming(
+                    dsl, style_template, emotion_vector, gen_mode, _on_token,
+                ):
+                    pass
+            else:
+                async for _ in eos.text_gen.generate_poem_streaming(
+                    dsl, style_template, emotion_vector, _on_token,
+                ):
+                    pass
+        finally:
+            done_event.set()
+
+    gen_task = asyncio.create_task(_generate())
+
+    # 立即 yield 第一个哨兵事件，通知主循环"这个候选开始了"
+    yield {"type": "start", "idx": idx, "primary": primary, "intensity": intensity}
+
+    # 主循环：持续从队列读 token，直到生成完毕
+    while not done_event.is_set() or not token_q.empty():
+        try:
+            token = await asyncio.wait_for(token_q.get(), timeout=0.05)
+            # yield token 事件（主循环负责格式化为 SSE）
+            yield {"type": "token", "idx": idx, "token": token, "partial": "".join(text_chunks)}
+        except asyncio.TimeoutError:
+            continue
+
+    await gen_task
 
     text = "".join(text_chunks)
 
@@ -105,23 +134,17 @@ async def _gen_single_candidate(
     # 本地提取 Hook（规则匹配，不调 LLM）
     hook = eos._extract_hook(text, gen_mode)
 
-    return idx, {
+    yield {
+        "type": "candidate",
+        "idx": idx,
         "text": text,
         "hook": hook,
         "dsl": dsl,
         "emotion": primary,
         "emotion_intensity": intensity,
-        "type": "lyrics" if gen_mode == GenerationMode.LYRICS else "poem",
+        "result_type": "lyrics" if gen_mode == GenerationMode.LYRICS else "poem",
         "score": 0.0,
     }
-
-
-def _emit_event(step: str, msg: str, data, elapsed: float) -> dict:
-    """创建事件 payload"""
-    payload = {"step": step, "msg": msg, "elapsed": round(elapsed, 2)}
-    if data is not None:
-        payload["data"] = data
-    return payload
 
 
 async def _rank_and_refine(
@@ -136,7 +159,7 @@ async def _rank_and_refine(
     events = []
 
     def emit(step, msg, data=None):
-        events.append(_emit_event(step, msg, data, time.time() - t0))
+        events.append(_emit(step, msg, data, time.time() - t0))
 
     # 1. 打分
     for c in candidates:
@@ -195,7 +218,6 @@ async def _rank_and_refine(
     best["hook"] = eos._extract_hook(best["text"], gen_mode)
     best["score"] = _safe_score(eos, best)
 
-    # applied_op 为 None = 无提升，无需修改
     op_label = applied_op if applied_op else "无需修改"
     emit("refine_done", f"精修完成: {op_label}", {
         "op": applied_op,
@@ -210,27 +232,25 @@ async def _rank_and_refine(
 
 # ==================== 主入口 ====================
 
-async def stream_generate_async(req, yield_fn):
+async def stream_generate_async(req):
     """
-    企业级流式生成。
+    企业级流式生成（async generator 版本）。
 
-    核心改进：
-    - as_completed：每个候选完成时立即 yield，不等全部完成
-    - 候选完成事件携带完整歌词内容，前端立即可见
-    - baseline 生成在后台并发进行，不阻塞主流程
+    直接 yield 事件 dict：
+    - 主循环实时消费 token 事件并立即 yield 到 HTTP 层
+    - 每个候选是独立 async generator，token 到达时立即推送
 
     流程：
     1. parse + emotion（本地，ms）
     2. dsl 生成（LLM 1次，~1-3s）
-    3. 并发候选生成，每个完成时立即 yield（~3-5s/候选）
-    4. 排序 + 可选 refine（~3-5s）
-    5. baseline（并发，不阻塞）
+    3. 并发候选生成，每个 token 实时 yield（~3-5s/候选）
+    4. 排序（~ms）
+    5. final
     """
     t0 = time.time()
 
     def emit(step, msg, data=None):
-        elapsed = time.time() - t0
-        return yield_fn(step, msg, data, elapsed)
+        return _emit(step, msg, data, time.time() - t0)
 
     try:
         eos = EnhancedAgentOS()
@@ -276,67 +296,76 @@ async def stream_generate_async(req, yield_fn):
             "preview": [s.get("section", "") + ":" + s.get("intent", "")[:10] for s in dsl],
         })
 
-        # ===== Step 3: 并发多候选生成（边完成边 yield）=====
+        # ===== Step 3: 并发候选生成 + token 实时流式推送 =====
         num_candidates = min(req.candidates, 3)
         yield emit("generate", f"正在生成 {num_candidates} 个候选歌词...", {
             "count": num_candidates,
         })
 
-        # 每个候选的 token 回调（同步，在 text_gen 的异步上下文中调用）
-        def make_token_handler(cand_idx):
-            accumulated = [""]
-            def _on_token(token):
-                accumulated[0] += token
-                yield_fn("token", "", {
-                    "candidate_index": cand_idx + 1,
-                    "total": num_candidates,
-                    "partial_text": accumulated[0],
-                }, time.time() - t0)
-            return _on_token
-
-        # 创建带索引的任务，as_completed 保证每个完成时立即 yield
-        tasks = [
+        # 启动所有候选生成器
+        candidate_gens = [
             _gen_single_candidate(
                 i, eos, emotion_vector, gen_mode,
                 style_template, constraints, dsl,
-                on_token=make_token_handler(i),
             )
             for i in range(num_candidates)
         ]
 
-        # 用 as_completed：哪个先完成就先 yield，不等最慢的
-        # 但 gather 所有结果确保主流程继续前拿到完整列表
-        completed_idxs = set()
-        candidate_dicts = [None] * num_candidates  # 按顺序存放
+        # 启动所有候选任务
+        pending = {asyncio.create_task(cg.__anext__()) for cg in candidate_gens}
+        candidate_results = [None] * num_candidates
+        started_candidates = set()
+        accumulated = [""] * num_candidates  # 每个候选的累积文本
 
-        # 先收集所有结果（用于后续流程）
-        pending = {asyncio.create_task(t) for t in tasks}
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                idx, c = task.result()
-                candidate_dicts[idx] = c
-                completed_idxs.add(idx)
+            for finished_task in done:
+                try:
+                    event = finished_task.result()
+                    idx = event["idx"]
 
-                # ★ 核心：立即 yield，让前端立即看到候选内容
-                score = _safe_score(eos, c)
-                c["score"] = score
-                yield emit("candidate", f"候选 {idx+1}/{num_candidates} 生成完成", {
-                    "index": idx + 1,
-                    "score": score,
-                    "hook": c.get("hook", "")[:40],
-                    "preview": c.get("text", "")[:80],
-                    "text": c.get("text", ""),
-                })
+                    if event["type"] == "start":
+                        # 候选开始，立即创建后续任务继续消费这个候选的 token
+                        started_candidates.add(idx)
+                        pending.add(asyncio.create_task(candidate_gens[idx].__anext__()))
 
-        # ===== Step 4: 打分排序 + 可选 refine =====
+                    elif event["type"] == "token":
+                        accumulated[idx] = event["partial"]
+                        # ★ 核心：立即 yield token 事件 → HTTP 层实时推送
+                        yield _emit("token", "", {
+                            "candidate_index": idx + 1,
+                            "total": num_candidates,
+                            "partial_text": event["partial"],
+                        }, time.time() - t0)
+
+                        # 继续消费这个候选
+                        pending.add(asyncio.create_task(candidate_gens[idx].__anext__()))
+
+                    elif event["type"] == "candidate":
+                        candidate_results[idx] = event
+                        # 候选完成，打分并 yield candidate 事件
+                        c = event
+                        c["score"] = _safe_score(eos, c)
+                        yield _emit("candidate", f"候选 {idx+1}/{num_candidates} 生成完成", {
+                            "index": idx + 1,
+                            "score": c["score"],
+                            "hook": c.get("hook", "")[:40],
+                            "preview": c.get("text", "")[:80],
+                            "text": c.get("text", ""),
+                        }, time.time() - t0)
+                        # 不再为这个候选创建任务
+
+                except StopAsyncIteration:
+                    pass
+
+        # ===== Step 4: 打分排序 =====
         best, refine_steps, rank_events = await _rank_and_refine(
-            eos, candidate_dicts, emotion_vector, gen_mode,
+            eos, candidate_results, emotion_vector, gen_mode,
             style_template, constraints, eos.objective_fn,
             eos.style_checker,
         )
         for evt in rank_events:
-            yield yield_fn(evt["step"], evt["msg"], evt.get("data"), evt.get("elapsed", 0))
+            yield evt
 
         # ===== Step 5: Baseline 对比（默认关闭）=====
         bl_text = bl_hook = ""
@@ -389,14 +418,14 @@ async def stream_generate_async(req, yield_fn):
                     "score": c.get("score", 0),
                     "hook": c.get("hook", ""),
                 }
-                for i, c in enumerate(candidate_dicts)
+                for i, c in enumerate(candidate_results)
             ],
         })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield emit("error", f"生成失败: {e}", None)
+        yield _emit("error", f"生成失败: {e}", None, time.time() - t0)
 
 
 def _run_baseline_sync(eos, text, mode, style, constraints, gen_mode, style_template, emotion_vector, dsl):

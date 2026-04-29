@@ -32,40 +32,22 @@ async def test_llm():
 @router.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest):
     """同步生成接口（保留兼容）"""
-    from backend.services.generator import stream_generate_async
-    import json
-
-    async def sync_wrapper():
-        def sse_format(step, msg, data, elapsed):
-            payload = {"step": step, "msg": msg, "elapsed": round(elapsed, 2)}
-            if data is not None:
-                payload["data"] = data
-            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-        result_data = None
-        async for item in stream_generate_async(req, sse_format):
-            if item:
-                result_data = item
-        return result_data
-
+    final_event = None
+    async for evt in stream_generate_async(req):
+        final_event = evt
     return {"status": "ok"}
 
 
 @router.post("/generate/stream")
 async def generate_stream(req: GenerateRequest):
-    """流式生成接口 — SSE。LLM 调用期间事件循环保持活跃，可实时推送每一步。"""
+    """流式生成接口 — SSE。每个 token 实时推送，用户可见打字机效果。"""
     import json
-
-    def sse_format(step, msg, data, elapsed):
-        payload = {"step": step, "msg": msg, "elapsed": round(elapsed, 2)}
-        if data is not None:
-            payload["data"] = data
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     async def event_stream():
         try:
-            async for item in stream_generate_async(req, sse_format):
-                if item:
-                    yield item
+            async for evt in stream_generate_async(req):
+                # evt 是 dict，直接 json 序列化后 yield
+                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
         except Exception as e:
             import traceback
             traceback.print_exc()
