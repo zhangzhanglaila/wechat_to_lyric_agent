@@ -820,20 +820,29 @@ class ObjectiveFunction:
         self._mode = mode
         self._weights = weights
 
+    def _get(self, result, attr, default=None):
+        """支持 dict 或 GenerationResult 对象"""
+        if isinstance(result, dict):
+            return result.get(attr, default)
+        return getattr(result, attr, default)
+
     def score(self, result: "GenerationResult") -> float:
         """
         对 GenerationResult 打目标分（用于 rank）。
+        支持 dict 或 GenerationResult 对象。
         """
-        if result.type == "lyrics":
+        result_type = self._get(result, "type", "lyrics")
+        score_details = self._get(result, "score_details") or {}
+        if result_type == "lyrics":
             weights = self._resolve_weights("lyrics")
             total = sum(
-                result.score_details.get(k, 0.0) * w
+                score_details.get(k, 0.0) * w
                 for k, w in weights.items()
             )
         else:
             weights = self._resolve_weights("poem")
             total = sum(
-                result.score_details.get(k, 0.0) * w
+                score_details.get(k, 0.0) * w
                 for k, w in weights.items()
             )
         return total
@@ -892,30 +901,41 @@ class CandidateScorer:
         ("emotional_depth", 0.2, 0.5),
     ]
 
-    def score(self, result: GenerationResult) -> tuple:
-        """返回 (总分, 详情字典)"""
-        if result.type == "lyrics":
+    def _get(self, result, attr, default=None):
+        """支持 dict 或 GenerationResult 对象"""
+        if isinstance(result, dict):
+            return result.get(attr, default)
+        return getattr(result, attr, default)
+
+    def score(self, result) -> tuple:
+        """返回 (总分, 详情字典)。支持 dict 或 GenerationResult 对象。"""
+        result_type = self._get(result, "type", "lyrics")
+        if result_type == "lyrics":
             return self._score_lyrics(result)
         else:
             return self._score_poem(result)
 
-    def _score_lyrics(self, result: GenerationResult) -> tuple:
+    def _score_lyrics(self, result) -> tuple:
+        text = self._get(result, "text", "")
+        hook = self._get(result, "hook", "")
+        emotion = self._get(result, "emotion", "")
+
         details = {}
 
         # Hook 强度
-        hook_strength = self._score_hook_strength(result.text, result.hook)
+        hook_strength = self._score_hook_strength(text, hook)
         details["hook_strength"] = hook_strength
 
         # 歌词变化
-        lyric_variation = self._score_lyric_variation(result.text)
+        lyric_variation = self._score_lyric_variation(text)
         details["lyric_variation"] = lyric_variation
 
         # 情绪一致性
-        emotion_consistency = self._score_emotion_consistency(result.text, result.emotion)
+        emotion_consistency = self._score_emotion_consistency(text, emotion)
         details["emotion_consistency"] = emotion_consistency
 
         # 可唱性
-        singability = self._score_singability(result.text)
+        singability = self._score_singability(text)
         details["singability"] = singability
 
         # 加权总分
@@ -942,23 +962,26 @@ class CandidateScorer:
         details["total"] = min(1.0, total)
         return details["total"], details
 
-    def _score_poem(self, result: GenerationResult) -> tuple:
+    def _score_poem(self, result) -> tuple:
+        text = self._get(result, "text", "")
+        emotion = self._get(result, "emotion", "")
+
         details = {}
 
         # 意象密度
-        imagery_density = self._score_imagery_density(result.text)
+        imagery_density = self._score_imagery_density(text)
         details["imagery_density"] = imagery_density
 
         # 新颖度
-        novelty = self._score_novelty(result.text)
+        novelty = self._score_novelty(text)
         details["novelty"] = novelty
 
         # 连贯性
-        coherence = self._score_coherence(result.text)
+        coherence = self._score_coherence(text)
         details["coherence"] = coherence
 
         # 情绪深度
-        emotional_depth = self._score_emotional_depth(result.text, result.emotion)
+        emotional_depth = self._score_emotional_depth(text, emotion)
         details["emotional_depth"] = emotional_depth
 
         total = (
@@ -1836,7 +1859,11 @@ class EnhancedAgentOS:
 
         # 5. 两阶段精修：只对 top 2 做完整 refine loop
         max_refine_steps = constraints.get("max_refine_steps", 3)
-        top_candidates = ranked[:2]
+        top_candidates = ranked[:2] if ranked else []
+
+        # 提前初始化，避免 UnboundLocalError
+        best_c = None
+        best_c_score = float("-inf")
 
         for ranked_entry in top_candidates:
             c = ranked_entry["result"]
@@ -1863,13 +1890,24 @@ class EnhancedAgentOS:
             c["step_records"] = step_records
             # Hook 可能已被改写，重新提取
             c["hook"] = self._extract_hook(c["text"], gen_mode)
-            # 记录最优候选的优化路径
-            if c is all_refine_candidates[0]:
+            # 追踪当前最优候选（用于记录创作路径）
+            primary_c, _ = emotion_vector.get_primary()
+            c_score = objective_fn.score_text(
+                c["text"], c.get("hook", ""), primary_c, gen_mode
+            ) - self.style_checker.penalty(c["text"], style_template)
+            if c_score > best_c_score:
+                best_c = c
+                best_c_score = c_score
                 creation_explanation["optimization_steps"] = step_records
                 creation_explanation["final_refine_steps"] = refine_steps
 
+        # 兜底：top_candidates 为空时
+        if best_c is None:
+            creation_explanation["optimization_steps"] = []
+            creation_explanation["final_refine_steps"] = 0
+
         # 6. 重新排序（refine 后）使用 composite score = objective - penalty
-        all_refine_candidates = [e["result"] for e in top_candidates] + [e["result"] for e in ranked[2:]]
+        all_refine_candidates = [e["result"] for e in top_candidates] + [e["result"] for e in (ranked[2:] if len(ranked) > 2 else [])]
         primary, _ = emotion_vector.get_primary()
         for c in all_refine_candidates:
             text = c.get("text", "")

@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-bg-primary text-gray-200 font-mono;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-white/[0.04] border border-white/[0.08] rounded-xl;
+  }
+
+  .control-label {
+    @apply text-xs text-gray-500 uppercase tracking-wider mb-1;
+  }
+
+  .accent-border {
+    @apply border border-accent-purple/40;
+  }
+
+  .btn-primary {
+    @apply bg-accent-purple/20 hover:bg-accent-purple/30 border border-accent-purple/50
+           text-purple-200 px-4 py-2 rounded-lg text-sm font-mono
+           transition-all duration-200 cursor-pointer;
+  }
+
+  .btn-primary:disabled {
+    @apply opacity-40 cursor-not-allowed;
+  }
+
+  .tag {
+    @apply text-xs px-2 py-0.5 rounded-full border border-white/10 text-gray-400;
+  }
+}

@@ -48,14 +48,29 @@ HOOK_PREFIX = "❗" if sys.stdout.encoding and "utf" in sys.stdout.encoding.lowe
 # ==================== LLM ====================
 
 def llm(prompt: str, temp: float = 0.8) -> str:
-    from openai import OpenAI
-    client = OpenAI(api_key=API_KEY, base_url=API_BASE)
+    """
+    使用 urllib 替代 OpenAI SDK，兼容代理环境。
+    """
+    import urllib.request
+    payload = json.dumps({
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temp,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{API_BASE}/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
     try:
-        return client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temp
-        ).choices[0].message.content
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            return result["choices"][0]["message"]["content"]
     except Exception as e:
         return f"LLM Error: {e}"
 

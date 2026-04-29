@@ -19,7 +19,19 @@
       "Bash(python:*)",
       "Bash(find D:/wechat_to_lyric_agent -name \"*.pyc\" -delete)",
       "Bash(find D:/wechat_to_lyric_agent -name \"__pycache__\" -type d -exec rm -rf {} +)",
-      "Bash(iconv -f utf-8 -t utf-8)"
+      "Bash(iconv -f utf-8 -t utf-8)",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(timeout 15 bash -c ':*)",
+      "Bash(timeout 20 bash -c ':*)",
+      "Bash(timeout 30 bash -c ':*)",
+      "Bash(pkill -f \"uvicorn backend.main\")",
+      "Bash(timeout 50 bash -c ':*)",
+      "Bash(timeout 90 bash -c ':*)",
+      "Bash(pkill -f \"uvicorn\")",
+      "Bash(curl -s http://localhost:8006/api/test_llm)",
+      "Bash(timeout 180 bash -c ':*)",
+      "Bash(curl:*)"
     ]
   }
 }

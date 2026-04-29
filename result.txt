@@ -1,0 +1,20 @@
+data: {"step": "parse", "msg": "解析输入...", "elapsed": 0.0}
+
+data: {"step": "emotion", "msg": "情绪建模: sadness (0.1)", "elapsed": 0.0, "data": {"emotion": "sadness", "intensity": 0.1}}
+
+data: {"step": "dsl", "msg": "生成结构...", "elapsed": 0.0}
+
+data: {"step": "dsl_done", "msg": "结构生成完成 (6 节)", "elapsed": 0.0, "data": {"sections": 6}}
+
+data: {"step": "generate", "msg": "正在生成 2 个候选歌词...", "elapsed": 0.0, "data": {"count": 2}}
+
+data: {"step": "candidate", "msg": "候选 1 生成完成", "elapsed": 13.17, "data": {"index": 1, "score": 0.18200000000000002, "hook": "原来快乐会过期", "preview": "【开场】雨打湿空荡的站台\n烟灰缸堆满了烟头\n【前Hook】声音突然就哑了。\n【Hook】原来快乐会过期\n【Hook】原来"}}
+
+data: {"step": "candidate", "msg": "候选 2 生成完成", "elapsed": 13.17, "data": {"index": 2, "score": 0.10200000000000001, "hook": "如果那时没放手呢", "preview": "【开场】空荡的站台，雨未停\n你转身时，烟头烫了手。\n【前Hook】有些话，快压不住了。\n【Hook】如果那时没放手呢\n【"}}
+
+data: {"step": "rank", "msg": "候选排序完成 (top: 0.182)", "elapsed": 0.0, "data": {"top_score": 0.18200000000000002, "total": 2}}
+
+data: {"step": "done", "msg": "生成完成 (score: 0.182)", "elapsed": 0.0, "data": {"final_score": 0.18200000000000002, "refine_steps": 0}}
+
+data: {"step": "final", "msg": "创作完成", "elapsed": 29.08, "data": {"mode": "lyrics", "style": "抖音伤感", "emotion": "sadness", "emotion_intensity": 0.1, "baseline_text": "【开场】雨打湿站台的灯\n你走后，雨就没停过。\n【前Hook】指尖开始发凉了。\n【Hook】爱，怎么也会过期？\n【Hook】爱，怎么也会过期？\n【Hook】我弄丢了昨天的你\n【Hook】我弄丢了昨天的你\n【结尾】这雨，也该停了。", "baseline_hook": "爱，怎么也会过期？", "baseline_score": 0.194, "baseline_score_details": {"hook_strength": 0.7, "lyric_variation": 0.0, "emotion_consistency": 0.3, "singability": 1.0, "total": 0.194}, "optimized_text": "【开场】雨打湿空荡的站台\n烟灰缸堆满了烟头\n【前Hook】声音突然就哑了。\n【Hook】原来快乐会过期\n【Hook】原来快乐会过期\n【Hook】我弄丢了你的笑\n【Hook】我弄丢了你的笑\n【结尾】怎么把梦吵醒了", "optimized_hook": "原来快乐会过期", "optimized_score": 0.18200000000000002, "optimized_score_details": {"hook_strength": 0.6000000000000001, "lyric_variation": 0.0, "emotion_consistency": 0.3, "singability": 1.0, "total": 0.18200000000000002}, "delta": -0.011999999999999983, "explanation": {"emotion_arc": "sadness (0.1)", "style_decisions": {"expression": "direct", "lyric_density": "short", "poem_form": "free"}, "structure_type": "抖音伤感", "hook_strategy": "single-pass generation", "objective_weights": null, "optimization_steps": [], "final_refine_steps": 0}, "candidates": [{"index": 1, "text": "【开场】雨打湿空荡的站台\n烟灰缸堆满了烟头\n【前Hook】声音突然就哑了。\n【Hook】原来快乐会过期\n【Hook】原来快乐会过期\n【Hook】我弄丢了你的笑\n【Hook】我弄丢了你的笑\n【结尾】怎么把梦吵醒了", "score": 0.18200000000000002}, {"index": 2, "text": "【开场】空荡的站台，雨未停\n你转身时，烟头烫了手。\n【前Hook】有些话，快压不住了。\n【Hook】如果那时没放手呢\n【Hook】如果那时没放手呢\n【Hook】那天你说的七点整\n【Hook】那天你说的七点整\n【结尾】这雨，也该停了。", "score": 0.10200000000000001}]}}
+
