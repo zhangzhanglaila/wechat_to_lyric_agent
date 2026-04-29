@@ -318,9 +318,26 @@ class TextGenerator:
         else:
             return self._generate_poem(dsl, style_template, emotion_vector)
 
+    def _style_semantic_guidance(self, style_name: str, expr: str) -> str:
+        """把风格名称转成简洁的语义约束词，写入 prompt（不是 UI 变量）。"""
+        style_short = {
+            "rap": "节奏强、短句、押韵、battle感",
+            "battle": "对抗挑衅、输赢对比、强硬不煽情",
+            "抖音伤感": "短平快口语、雨夜烟街意象、Hook共鸣可复述",
+            "抖音温情": "温暖治愈、口语亲切、陪伴守护意象",
+            "情歌": "情感表达、可唱有节奏、叙事感强",
+        }
+        expr_short = {
+            "direct": "直抒胸臆",
+            "metaphor": "意象传情、含蓄蕴藉",
+            "narrative": "故事感强",
+        }
+        return f"{style_short.get(style_name, style_short['抖音伤感'])}。表达：{expr_short.get(expr, '直抒胸臆')}"
+
     def generate_from_dsl_streaming(
         self, dsl: List[dict], style_template: StyleTemplate,
         emotion_vector: EmotionVector, mode: GenerationMode, yield_fn,
+        user_input: str = "", style_name: str = "",
     ):
         """
         流式版本：返回一个 async generator，yield 每个 token。
@@ -342,41 +359,33 @@ class TextGenerator:
                 "outro": "【结尾】",
             }
             label = section_labels.get(section, "")
-            structure_parts.append(f"{i+1}. {label} — 创作意图：{intent}")
+            structure_parts.append(f"{i+1}. {label} — {intent}")
 
         structure_desc = "\n".join(structure_parts)
 
         expr = getattr(style_template, 'expression', 'direct') if style_template else 'direct'
         density = getattr(style_template, 'lyric_density', 'short') if style_template else 'short'
-        style_rules = {
-            "direct": "短平快、口语化、直抒胸臆",
-            "metaphor": "有文学性、含蓄蕴藉、意象丰富",
-            "narrative": "叙事感强、有故事感、可演唱",
-        }
         density_rules = {
-            "short": "短句为主，每行 5-10 字",
-            "medium": "中等长度，每行 10-15 字",
-            "long": "长句为佳，每行 15-20 字",
+            "short": "短句5-10字",
+            "medium": "中等10-15字",
+            "long": "长句15-20字",
         }
 
-        prompt = f"""根据以下结构生成一首完整歌词。
+        style_semantic = self._style_semantic_guidance(style_name, expr)
+        semantic_req = f"必须围绕「{user_input}」展开，不允许偏离。" if user_input else ""
 
-【情绪】{emotion_context}（强度 {intensity:.1f}）
-【风格】{style_rules.get(expr, '短平快口语化')}
-【句式】{density_rules.get(density, '短句为主')}
+        prompt = f"""生成歌词：
 
-【必须严格遵守的结构】
-{structure_desc}
+【语义】{emotion_context}（{intensity:.1f}）
+【风格】{style_semantic}
+【句式】{density_rules.get(density, '短句')}
 
-【创作要求】
-- 每个节点的内容必须真正体现其"创作意图"
-- Hook 句必须精炼有爆发力（4-10字），可复述
-- 歌词要有画面感、具体不空洞
-- 情绪贯穿全篇，统一自然
-- 各节之间衔接自然，有起承转合
+【结构】\n{structure_desc}
 
-【输出格式】
-直接输出歌词正文，每行一行，用【】标注节类型（如【开场】【Hook】【结尾】），不要输出任何解释。
+【强制】{semantic_req}
+- Hook精炼4-10字、可复述
+- 有画面感、不空洞
+- 用【】标注：开场/前Hook/Hook/结尾
 
 歌词："""
 
@@ -1929,7 +1938,9 @@ class EnhancedAgentOS:
     """
 
     def __init__(self, *args, **kwargs):
-        self.kernel = AgentOSKernel(*args, **kwargs)
+        self._kernel_args = args
+        self._kernel_kwargs = kwargs
+        self._kernel = None
         self.compression = ChatCompressionLayer()
         self.humanizer = HumanRewriteLayer(intensity=0.3)
         self.dsl_gen = StructureDSLGenerator()
@@ -1941,6 +1952,12 @@ class EnhancedAgentOS:
         self.analyzer = TextAnalyzer()
         self.refine_loop = RefineLoop()
         self.gate = ExecutionGate()
+
+    @property
+    def kernel(self):
+        if self._kernel is None:
+            self._kernel = AgentOSKernel(*self._kernel_args, **self._kernel_kwargs)
+        return self._kernel
 
     def generate(
         self,
@@ -2307,7 +2324,9 @@ class EnhancedAgentOS:
         return self.kernel.run()
 
     def shutdown(self):
-        return self.kernel.shutdown()
+        if self._kernel is not None:
+            return self._kernel.shutdown()
+        return None
 
     def get_state_snapshot(self):
         return self.kernel.get_state_snapshot()

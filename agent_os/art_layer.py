@@ -106,28 +106,24 @@ def llm_stream(prompt: str, temp: float = 0.8):
             )
 
             with urllib.request.urlopen(req, timeout=120) as resp:
-                buffer = b""
                 while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
+                    line = resp.readline()
+                    if not line:
                         break
-                    buffer += chunk
-                    lines = buffer.split(b"\n")
-                    buffer = lines[-1]
-                    for line in lines[:-1]:
-                        line = line.strip()
-                        if line.startswith(b"data: "):
-                            data = line[6:]
-                            if data == b"[DONE]":
-                                continue
-                            try:
-                                obj = json.loads(data.decode("utf-8"))
-                                delta = obj.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "") or delta.get("text", "")
-                                if content:
-                                    q.put(content)
-                            except Exception:
-                                pass
+                    line = line.strip()
+                    if not line.startswith(b"data: "):
+                        continue
+                    data = line[6:]
+                    if data == b"[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data.decode("utf-8"))
+                        delta = obj.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "") or delta.get("text", "")
+                        if content:
+                            q.put(content)
+                    except Exception:
+                        pass
         except Exception as e:
             q.put(f"LLM Error: {e}")
         finally:
@@ -828,7 +824,8 @@ STYLE_TEMPLATES = {
 
 def get_style_template(preset: StylePreset) -> StyleTemplate:
     """获取风格模板"""
-    return STYLE_TEMPLATES.get(preset, STYLE_TEMPLATES[StylePreset.HEARTBREAK])
+    template = STYLE_TEMPLATES.get(preset, STYLE_TEMPLATES[StylePreset.HEARTBREAK])
+    return copy.copy(template)
 
 
 # ==================== Art Layer: Emotion Curve ====================

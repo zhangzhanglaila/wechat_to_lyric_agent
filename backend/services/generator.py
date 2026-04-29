@@ -13,7 +13,7 @@ import os
 import json
 import time
 import asyncio
-import queue
+import threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from agent_os.integration import (
@@ -21,6 +21,18 @@ from agent_os.integration import (
     CandidateScorer,
 )
 from agent_os.art_layer import EmotionVector
+
+_EOS = None
+_EOS_LOCK = threading.Lock()
+
+
+def _get_eos() -> EnhancedAgentOS:
+    global _EOS
+    if _EOS is None:
+        with _EOS_LOCK:
+            if _EOS is None:
+                _EOS = EnhancedAgentOS()
+    return _EOS
 
 
 # ==================== 工具函数 ====================
@@ -70,6 +82,8 @@ def _emit(step: str, msg: str, data, elapsed: float) -> dict:
 async def _gen_single_candidate(
     idx: int,
     eos, emotion_vector, gen_mode, style_template, constraints, dsl,
+    user_input: str = "",
+    style_name: str = "",
 ):
     """
     生成单个候选。是一个 async generator，yield 第一个 token 时通知主循环开始监听。
@@ -86,10 +100,7 @@ async def _gen_single_candidate(
     def _on_token(token):
         """同步回调：把 token 放入队列（在 LLM 线程中调用）"""
         text_chunks.append(token)
-        try:
-            token_q.put_nowait(token)
-        except queue.Full:
-            pass
+        token_q.put_nowait(token)
 
     # 启动后台生成协程
     async def _generate():
@@ -97,6 +108,7 @@ async def _gen_single_candidate(
             if gen_mode == GenerationMode.LYRICS:
                 async for _ in eos.text_gen.generate_from_dsl_streaming(
                     dsl, style_template, emotion_vector, gen_mode, _on_token,
+                    user_input=user_input, style_name=style_name,
                 ):
                     pass
             else:
@@ -253,12 +265,13 @@ async def stream_generate_async(req):
         return _emit(step, msg, data, time.time() - t0)
 
     try:
-        eos = EnhancedAgentOS()
+        eos = _get_eos()
         gen_mode = GenerationMode.LYRICS if req.mode == "lyrics" else GenerationMode.POEM
         constraints = _build_constraints(req)
 
         # ===== Step 1: parse =====
         yield emit("parse", "解析输入...", {"input": req.text[:50]})
+        await asyncio.sleep(0)
 
         if isinstance(req.text, list):
             compression_result = await asyncio.to_thread(
@@ -282,9 +295,11 @@ async def stream_generate_async(req):
             "intensity": intensity,
             "style": style_template.name if style_template else "default",
         })
+        await asyncio.sleep(0)
 
         # ===== Step 2: DSL 生成 =====
         yield emit("dsl", "生成结构...")
+        await asyncio.sleep(0)
         dsl = await asyncio.to_thread(
             eos.dsl_gen.generate,
             emotion_vector, gen_mode, style_template,
@@ -295,18 +310,21 @@ async def stream_generate_async(req):
             "sections": len(dsl),
             "preview": [s.get("section", "") + ":" + s.get("intent", "")[:10] for s in dsl],
         })
+        await asyncio.sleep(0)
 
         # ===== Step 3: 并发候选生成 + token 实时流式推送 =====
         num_candidates = min(req.candidates, 3)
         yield emit("generate", f"正在生成 {num_candidates} 个候选歌词...", {
             "count": num_candidates,
         })
+        await asyncio.sleep(0)
 
         # 启动所有候选生成器
         candidate_gens = [
             _gen_single_candidate(
                 i, eos, emotion_vector, gen_mode,
                 style_template, constraints, dsl,
+                user_input=req.text, style_name=req.style or "",
             )
             for i in range(num_candidates)
         ]
@@ -314,8 +332,6 @@ async def stream_generate_async(req):
         # 启动所有候选任务
         pending = {asyncio.create_task(cg.__anext__()) for cg in candidate_gens}
         candidate_results = [None] * num_candidates
-        started_candidates = set()
-        accumulated = [""] * num_candidates  # 每个候选的累积文本
 
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -326,17 +342,16 @@ async def stream_generate_async(req):
 
                     if event["type"] == "start":
                         # 候选开始，立即创建后续任务继续消费这个候选的 token
-                        started_candidates.add(idx)
                         pending.add(asyncio.create_task(candidate_gens[idx].__anext__()))
 
                     elif event["type"] == "token":
-                        accumulated[idx] = event["partial"]
                         # ★ 核心：立即 yield token 事件 → HTTP 层实时推送
                         yield _emit("token", "", {
                             "candidate_index": idx + 1,
                             "total": num_candidates,
                             "partial_text": event["partial"],
                         }, time.time() - t0)
+                        await asyncio.sleep(0)  # 让事件循环发送 HTTP chunk
 
                         # 继续消费这个候选
                         pending.add(asyncio.create_task(candidate_gens[idx].__anext__()))
@@ -353,6 +368,7 @@ async def stream_generate_async(req):
                             "preview": c.get("text", "")[:80],
                             "text": c.get("text", ""),
                         }, time.time() - t0)
+                        await asyncio.sleep(0)
                         # 不再为这个候选创建任务
 
                 except StopAsyncIteration:
