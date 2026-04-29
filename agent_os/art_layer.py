@@ -25,8 +25,10 @@ import os
 import sys
 import json
 import time
+import asyncio
 import hashlib
 import threading
+import queue
 import copy
 from typing import Dict, List, Optional, Any, Set, FrozenSet
 from dataclasses import dataclass, field
@@ -73,6 +75,83 @@ def llm(prompt: str, temp: float = 0.8) -> str:
             return result["choices"][0]["message"]["content"]
     except Exception as e:
         return f"LLM Error: {e}"
+
+
+def llm_stream(prompt: str, temp: float = 0.8):
+    """
+    流式 LLM 调用 yield 每个 token。
+    返回一个 async 生成器，跨线程安全，通过 queue 传递 token。
+    """
+    q = queue.Queue()
+    done_event = threading.Event()
+
+    def _thread_target():
+        try:
+            import urllib.request
+            payload = json.dumps({
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temp,
+                "stream": True,
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                f"{API_BASE}/chat/completions",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                buffer = b""
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    lines = buffer.split(b"\n")
+                    buffer = lines[-1]
+                    for line in lines[:-1]:
+                        line = line.strip()
+                        if line.startswith(b"data: "):
+                            data = line[6:]
+                            if data == b"[DONE]":
+                                continue
+                            try:
+                                obj = json.loads(data.decode("utf-8"))
+                                delta = obj.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "") or delta.get("text", "")
+                                if content:
+                                    q.put(content)
+                            except Exception:
+                                pass
+        except Exception as e:
+            q.put(f"LLM Error: {e}")
+        finally:
+            done_event.set()
+
+    t = threading.Thread(target=_thread_target, daemon=True)
+    t.start()
+
+    async def _async_gen():
+        while not done_event.is_set() or not q.empty():
+            try:
+                token = q.get(timeout=0.05)
+                yield token
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+        # 消费剩余
+        while True:
+            try:
+                token = q.get_nowait()
+                yield token
+            except queue.Empty:
+                break
+
+    return _async_gen()
 
 
 # ==================== Art Layer: Emotion Vector ====================

@@ -7,8 +7,9 @@ Generator Service - 企业级高性能歌词/诗歌生成
 - 本地打分（不调用 LLM）
 - 最多一次 refine
 - SSE 每步实时推送，携带丰富内容
+- 每个候选完成时立即 yield（as_completed 模式）
 
-目标：< 15s 出结果
+目标：< 15s 出结果，用户实时可见每一步
 """
 import sys
 import os
@@ -61,20 +62,39 @@ def _build_constraints(req) -> dict:
 # ==================== 核心生成逻辑 ====================
 
 async def _gen_single_candidate(
-    eos, emotion_vector, gen_mode, style_template, constraints, dsl, candidate_idx: int
-) -> dict:
+    idx: int,
+    eos, emotion_vector, gen_mode, style_template, constraints, dsl,
+    on_token=None,
+) -> tuple:
     """
-    生成单个候选。
+    生成单个候选，返回 (idx, candidate_dict)。
 
-    一次 LLM 生成 + 本地 humanizer + 本地 hook 提取
+    每个候选独立，不依赖其他候选。
+    on_token 不为 None 时，每生成一个 token 就调用它（打字机效果）。
     """
     primary, intensity = emotion_vector.get_primary()
 
-    # 一次性生成全部歌词（DSL 节点在 text_gen 内部遍历）
-    text = await asyncio.to_thread(
-        eos.text_gen.generate_from_dsl,
-        dsl, style_template, emotion_vector, gen_mode,
-    )
+    # 流式生成歌词/诗歌：async for 驱动 token 实时推送
+    text_chunks = []
+
+    def _handle_token(token):
+        text_chunks.append(token)
+        if on_token is not None:
+            on_token(token)
+
+    if gen_mode == GenerationMode.LYRICS:
+        # async for 驱动 llm_stream 异步迭代，_handle_token 实时被调用
+        async for _ in eos.text_gen.generate_from_dsl_streaming(
+            dsl, style_template, emotion_vector, gen_mode, _handle_token,
+        ):
+            pass
+    else:
+        async for _ in eos.text_gen.generate_poem_streaming(
+            dsl, style_template, emotion_vector, _handle_token,
+        ):
+            pass
+
+    text = "".join(text_chunks)
 
     # 本地人类化处理（不调 LLM）
     text = await asyncio.to_thread(
@@ -85,7 +105,7 @@ async def _gen_single_candidate(
     # 本地提取 Hook（规则匹配，不调 LLM）
     hook = eos._extract_hook(text, gen_mode)
 
-    return {
+    return idx, {
         "text": text,
         "hook": hook,
         "dsl": dsl,
@@ -109,8 +129,7 @@ async def _rank_and_refine(
     constraints, objective_fn, style_checker,
 ):
     """
-    并发打分 + 可选一次 refine。
-
+    排序 + 可选一次 refine。
     返回 (best_candidate, refine_steps_list, list_of_events_to_yield)
     """
     t0 = time.time()
@@ -119,16 +138,15 @@ async def _rank_and_refine(
     def emit(step, msg, data=None):
         events.append(_emit_event(step, msg, data, time.time() - t0))
 
-    # 1. 并发打分
+    # 1. 打分
     for c in candidates:
         c["score"] = _safe_score(eos, c)
-        c["score_details"] = {}
 
     # 2. 排序
     candidates.sort(key=lambda x: x["score"], reverse=True)
     best = candidates[0]
 
-    emit("rank", f"候选排序完成", {
+    emit("rank", "候选排序完成", {
         "top_score": best["score"],
         "total": len(candidates),
         "candidates": [
@@ -137,7 +155,7 @@ async def _rank_and_refine(
         ],
     })
 
-    # 3. 可选一次 refine（只对 top1）
+    # 3. 可选一次 refine
     if constraints.get("max_refine_steps", 0) <= 0:
         emit("done", f"生成完成 (score: {best['score']:.3f})", {
             "final_score": best["score"],
@@ -177,12 +195,12 @@ async def _rank_and_refine(
     best["hook"] = eos._extract_hook(best["text"], gen_mode)
     best["score"] = _safe_score(eos, best)
 
-    # applied_op 为 None 表示"无提升，无需修改"
+    # applied_op 为 None = 无提升，无需修改
     op_label = applied_op if applied_op else "无需修改"
     emit("refine_done", f"精修完成: {op_label}", {
         "op": applied_op,
         "score": best["score"],
-        "before_score": candidates[0].get("score", 0) if candidates else 0,
+        "before_score": candidates[0].get("score", 0),
         "issues": [k for k, v in issues.items() if v],
     })
 
@@ -194,16 +212,19 @@ async def _rank_and_refine(
 
 async def stream_generate_async(req, yield_fn):
     """
-    企业级高性能流式生成。
+    企业级流式生成。
+
+    核心改进：
+    - as_completed：每个候选完成时立即 yield，不等全部完成
+    - 候选完成事件携带完整歌词内容，前端立即可见
+    - baseline 生成在后台并发进行，不阻塞主流程
 
     流程：
-    1. parse + emotion（本地，ms 级）
+    1. parse + emotion（本地，ms）
     2. dsl 生成（LLM 1次，~1-3s）
-    3. 并发生成 N 个候选（各自 1次 LLM，~3-5s 并发）
-    4. 本地打分 + 排序（本地，ms 级）
-    5. 可选 1次 refine（LLM 1次，~3-5s）
-
-    目标延迟：10~20s
+    3. 并发候选生成，每个完成时立即 yield（~3-5s/候选）
+    4. 排序 + 可选 refine（~3-5s）
+    5. baseline（并发，不阻塞）
     """
     t0 = time.time()
 
@@ -255,33 +276,58 @@ async def stream_generate_async(req, yield_fn):
             "preview": [s.get("section", "") + ":" + s.get("intent", "")[:10] for s in dsl],
         })
 
-        # ===== Step 3: 并发多候选生成 =====
+        # ===== Step 3: 并发多候选生成（边完成边 yield）=====
         num_candidates = min(req.candidates, 3)
         yield emit("generate", f"正在生成 {num_candidates} 个候选歌词...", {
             "count": num_candidates,
         })
 
-        # 并发执行，等全部完成后统一 yield
+        # 每个候选的 token 回调（同步，在 text_gen 的异步上下文中调用）
+        def make_token_handler(cand_idx):
+            accumulated = [""]
+            def _on_token(token):
+                accumulated[0] += token
+                yield_fn("token", "", {
+                    "candidate_index": cand_idx + 1,
+                    "total": num_candidates,
+                    "partial_text": accumulated[0],
+                }, time.time() - t0)
+            return _on_token
+
+        # 创建带索引的任务，as_completed 保证每个完成时立即 yield
         tasks = [
             _gen_single_candidate(
-                eos, emotion_vector, gen_mode, style_template,
-                constraints, dsl, i,
+                i, eos, emotion_vector, gen_mode,
+                style_template, constraints, dsl,
+                on_token=make_token_handler(i),
             )
             for i in range(num_candidates)
         ]
-        candidate_dicts = await asyncio.gather(*tasks)
 
-        # 逐个推送候选完成事件（携带完整内容）
-        for i, c in enumerate(candidate_dicts):
-            score = _safe_score(eos, c)
-            c["score"] = score
-            yield emit("candidate", f"候选 {i+1}/{num_candidates} 生成完成", {
-                "index": i + 1,
-                "score": score,
-                "hook": c.get("hook", "")[:40],
-                "preview": c.get("text", "")[:80],
-                "text": c.get("text", ""),  # 完整歌词内容
-            })
+        # 用 as_completed：哪个先完成就先 yield，不等最慢的
+        # 但 gather 所有结果确保主流程继续前拿到完整列表
+        completed_idxs = set()
+        candidate_dicts = [None] * num_candidates  # 按顺序存放
+
+        # 先收集所有结果（用于后续流程）
+        pending = {asyncio.create_task(t) for t in tasks}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                idx, c = task.result()
+                candidate_dicts[idx] = c
+                completed_idxs.add(idx)
+
+                # ★ 核心：立即 yield，让前端立即看到候选内容
+                score = _safe_score(eos, c)
+                c["score"] = score
+                yield emit("candidate", f"候选 {idx+1}/{num_candidates} 生成完成", {
+                    "index": idx + 1,
+                    "score": score,
+                    "hook": c.get("hook", "")[:40],
+                    "preview": c.get("text", "")[:80],
+                    "text": c.get("text", ""),
+                })
 
         # ===== Step 4: 打分排序 + 可选 refine =====
         best, refine_steps, rank_events = await _rank_and_refine(
@@ -292,14 +338,19 @@ async def stream_generate_async(req, yield_fn):
         for evt in rank_events:
             yield yield_fn(evt["step"], evt["msg"], evt.get("data"), evt.get("elapsed", 0))
 
-        # ===== Step 5: Baseline 对比 =====
-        yield emit("baseline", "正在生成 baseline 对比...", None)
+        # ===== Step 5: Baseline 对比（默认关闭）=====
+        bl_text = bl_hook = ""
+        bl_score = 0.0
+        bl_details = {}
         scorer = CandidateScorer()
-        bl_text, bl_hook, bl_score, bl_details = await asyncio.to_thread(
-            _run_baseline_sync,
-            eos, req.text, req.mode, req.style, constraints,
-            gen_mode, style_template, emotion_vector, dsl,
-        )
+
+        if getattr(req, 'include_baseline', False):
+            yield emit("baseline", "正在生成 baseline 对比...", None)
+            bl_text, bl_hook, bl_score, bl_details = await asyncio.to_thread(
+                _run_baseline_sync,
+                eos, req.text, req.mode, req.style, constraints,
+                gen_mode, style_template, emotion_vector, dsl,
+            )
 
         _, opt_details = scorer.score(best) if best else (0.0, {})
 
@@ -317,7 +368,7 @@ async def stream_generate_async(req, yield_fn):
             "optimized_hook": best.get("hook", "") if best else "",
             "optimized_score": best.get("score", 0) if best else 0,
             "optimized_score_details": opt_details,
-            "delta": (best.get("score", 0) - bl_score) if best else -bl_score,
+            "delta": (best.get("score", 0) - bl_score) if best else 0.0,
             "explanation": {
                 "emotion_arc": f"{primary_emotion} ({intensity:.1f})",
                 "style_decisions": {

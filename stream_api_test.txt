@@ -1,0 +1,12 @@
+data: {"step": "parse", "msg": "解析输入...", "elapsed": 0.0, "data": {"input": "我好恨你"}}
+
+data: {"step": "emotion", "msg": "情绪建模: sadness (0.1)", "elapsed": 0.0, "data": {"emotion": "sadness", "intensity": 0.1, "style": "抖音伤感"}}
+
+data: {"step": "dsl", "msg": "生成结构...", "elapsed": 0.0}
+
+data: {"step": "dsl_done", "msg": "结构生成完成 (6 节)", "elapsed": 0.0, "data": {"sections": 6, "preview": ["intro:场景设定（短句）", "verse:叙述（短句，口语）", "pre_hook:情绪铺垫（暗示）", "hook:核心记忆点（重复）", "hook:强化记忆", "outro:情绪收束（短）"]}}
+
+data: {"step": "generate", "msg": "正在生成 1 个候选歌词...", "elapsed": 0.0, "data": {"count": 1}}
+
+data: {"step": "error", "msg": "生成失败: 'async for' requires an object with __aiter__ method, got coroutine", "elapsed": 0.0}
+

@@ -2,6 +2,11 @@
 GenWriter Agent - FastAPI Backend
 """
 import os
+from dotenv import load_dotenv
+
+# 显式加载 .env，确保子进程也能读到环境变量
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles

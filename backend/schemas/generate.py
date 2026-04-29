@@ -12,9 +12,10 @@ class GenerateRequest(BaseModel):
     lyric_density: Optional[str] = Field(default=None, description="句长: short / medium / long")
     poem_form: Optional[str] = Field(default=None, description="诗歌体裁: free / classical / imagist / diary")
     beam_width: int = Field(default=2, ge=1, le=4)
-    candidates: int = Field(default=3, ge=1, le=6)
-    max_refine_steps: int = Field(default=3, ge=0, le=5)
+    candidates: int = Field(default=1, ge=1, le=6)
+    max_refine_steps: int = Field(default=0, ge=0, le=5)
     explain: bool = Field(default=True)
+    include_baseline: bool = Field(default=False, description="是否包含 baseline 对比（默认关闭）")
     weights: Optional[Dict[str, float]] = Field(default=None, description="自定义目标函数权重")
     structure: Optional[List[Dict]] = Field(default=None, description="用户自定义 DSL")
 

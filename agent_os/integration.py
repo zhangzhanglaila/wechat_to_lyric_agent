@@ -318,6 +318,125 @@ class TextGenerator:
         else:
             return self._generate_poem(dsl, style_template, emotion_vector)
 
+    def generate_from_dsl_streaming(
+        self, dsl: List[dict], style_template: StyleTemplate,
+        emotion_vector: EmotionVector, mode: GenerationMode, yield_fn,
+    ):
+        """
+        流式版本：返回一个 async generator，yield 每个 token。
+        令牌通过 yield_fn 实时推送（供 SSE 前端显示）。
+        """
+        from agent_os.art_layer import llm_stream
+
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
+
+        structure_parts = []
+        for i, item in enumerate(dsl):
+            section = item.get("section", "verse")
+            intent = item.get("intent", "")
+            section_labels = {
+                "intro": "【开场】",
+                "hook": "【Hook】",
+                "pre_hook": "【前Hook】",
+                "outro": "【结尾】",
+            }
+            label = section_labels.get(section, "")
+            structure_parts.append(f"{i+1}. {label} — 创作意图：{intent}")
+
+        structure_desc = "\n".join(structure_parts)
+
+        expr = getattr(style_template, 'expression', 'direct') if style_template else 'direct'
+        density = getattr(style_template, 'lyric_density', 'short') if style_template else 'short'
+        style_rules = {
+            "direct": "短平快、口语化、直抒胸臆",
+            "metaphor": "有文学性、含蓄蕴藉、意象丰富",
+            "narrative": "叙事感强、有故事感、可演唱",
+        }
+        density_rules = {
+            "short": "短句为主，每行 5-10 字",
+            "medium": "中等长度，每行 10-15 字",
+            "long": "长句为佳，每行 15-20 字",
+        }
+
+        prompt = f"""根据以下结构生成一首完整歌词。
+
+【情绪】{emotion_context}（强度 {intensity:.1f}）
+【风格】{style_rules.get(expr, '短平快口语化')}
+【句式】{density_rules.get(density, '短句为主')}
+
+【必须严格遵守的结构】
+{structure_desc}
+
+【创作要求】
+- 每个节点的内容必须真正体现其"创作意图"
+- Hook 句必须精炼有爆发力（4-10字），可复述
+- 歌词要有画面感、具体不空洞
+- 情绪贯穿全篇，统一自然
+- 各节之间衔接自然，有起承转合
+
+【输出格式】
+直接输出歌词正文，每行一行，用【】标注节类型（如【开场】【Hook】【结尾】），不要输出任何解释。
+
+歌词："""
+
+        async def _token_stream():
+            async for token in llm_stream(prompt, temp=0.8):
+                yield_fn(token)
+                yield token
+
+        return _token_stream()
+
+    def generate_poem_streaming(
+        self, dsl: List[dict], style_template: StyleTemplate,
+        emotion_vector: EmotionVector, yield_fn,
+    ):
+        """诗歌流式生成"""
+        from agent_os.art_layer import llm_stream
+
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
+
+        structure_parts = []
+        line_type_labels = {
+            "image": "意象/画面",
+            "contrast": "对比/反转",
+            "closure": "收束/留白",
+            "feeling": "情感/咏叹",
+        }
+        for i, item in enumerate(dsl):
+            line_type = item.get("line_type", "feeling")
+            intent = item.get("intent", "")
+            label = line_type_labels.get(line_type, "情感/咏叹")
+            structure_parts.append(f"{i+1}. [{label}] — 创作意图：{intent}")
+
+        structure_desc = "\n".join(structure_parts)
+
+        prompt = f"""根据以下结构生成一首完整诗歌。
+
+【情绪】{emotion_context}（强度 {intensity:.1f}）
+
+【必须严格遵守的结构】
+{structure_desc}
+
+【创作要求】
+- 每行的内容必须真正体现其"创作意图"
+- 诗歌语言精炼，有意象、有留白
+- 情绪贯穿全篇，统一自然
+- 禁止口号式结尾
+
+【输出格式】
+直接输出诗歌正文，每行一行，不要输出任何解释。
+
+诗歌："""
+
+        async def _token_stream():
+            async for token in llm_stream(prompt, temp=0.8):
+                yield_fn(token)
+                yield token
+
+        return _token_stream()
+
     def _generate_node(self, intent: str, section: str,
                        style_template: StyleTemplate,
                        emotion_vector: EmotionVector,
@@ -336,63 +455,118 @@ class TextGenerator:
     def _generate_lyrics(self, dsl: List[dict], style_template: StyleTemplate,
                           emotion_vector: EmotionVector) -> str:
         """
-        歌词生成 —— 逐 DSL 节点强约束生成。
+        歌词生成 —— 单次 LLM 调用生成整首歌。
 
-        每个节点按 section 类型 + intent 生成，intent 直接决定 prompt 核心内容。
+        将所有 DSL 节点的 intent + section 类型汇总到一条 prompt，
+        一次生成整首歌词（而非逐节点调用 LLM）。
         """
-        lines = []
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
 
-        for item in dsl:
+        # 构建结构描述
+        structure_parts = []
+        for i, item in enumerate(dsl):
             section = item.get("section", "verse")
             intent = item.get("intent", "")
+            section_labels = {
+                "intro": "【开场】",
+                "hook": "【Hook】",
+                "pre_hook": "【前Hook】",
+                "outro": "【结尾】",
+            }
+            label = section_labels.get(section, "")
+            structure_parts.append(f"{i+1}. {label} — 创作意图：{intent}")
 
-            if section == "hook":
-                # Hook 节点：生成 + 可选重复
-                hook_text = self._generate_lyrics_node(intent, "hook", style_template, emotion_vector)
-                lines.append(f"【Hook】{hook_text}")
-                if style_template and style_template.name == "抖音伤感":
-                    lines.append(f"【Hook】{hook_text}")
-            elif section == "pre_hook":
-                pre_hook = self._generate_lyrics_node(intent, "pre_hook", style_template, emotion_vector)
-                lines.append(f"【前Hook】{pre_hook}")
-            elif section == "intro":
-                intro = self._generate_lyrics_node(intent, "intro", style_template, emotion_vector)
-                lines.append(f"【开场】{intro}")
-            elif section == "outro":
-                outro = self._generate_lyrics_node(intent, "outro", style_template, emotion_vector)
-                lines.append(f"【结尾】{outro}")
-            else:
-                # Verse：intent 是约束核心
-                verse = self._generate_lyrics_node(intent, "verse", style_template, emotion_vector)
-                lines.append(verse)
+        structure_desc = "\n".join(structure_parts)
 
-        return "\n".join(lines)
+        # 风格约束
+        expr = getattr(style_template, 'expression', 'direct') if style_template else 'direct'
+        density = getattr(style_template, 'lyric_density', 'short') if style_template else 'short'
+        style_rules = {
+            "direct": "短平快、口语化、直抒胸臆",
+            "metaphor": "有文学性、含蓄蕴藉、意象丰富",
+            "narrative": "叙事感强、有故事感、可演唱",
+        }
+        density_rules = {
+            "short": "短句为主，每行 5-10 字",
+            "medium": "中等长度，每行 10-15 字",
+            "long": "长句为佳，每行 15-20 字",
+        }
+
+        prompt = f"""根据以下结构生成一首完整歌词。
+
+【情绪】{emotion_context}（强度 {intensity:.1f}）
+【风格】{style_rules.get(expr, '短平快口语化')}
+【句式】{density_rules.get(density, '短句为主')}
+
+【必须严格遵守的结构】
+{structure_desc}
+
+【创作要求】
+- 每个节点的内容必须真正体现其"创作意图"
+- Hook 句必须精炼有爆发力（4-10字），可复述
+- 歌词要有画面感、具体不空洞
+- 情绪贯穿全篇，统一自然
+- 各节之间衔接自然，有起承转合
+
+【输出格式】
+直接输出歌词正文，每行一行，用【】标注节类型（如【开场】【Hook】【结尾】），不要输出任何解释。
+
+歌词："""
+
+        try:
+            result = llm(prompt, temp=0.8).strip()
+            return result
+        except Exception:
+            return "算了 我不追了"
 
     def _generate_poem(self, dsl: List[dict], style_template: StyleTemplate,
                        emotion_vector: EmotionVector) -> str:
         """
-        诗歌生成 —— 逐 DSL 行节点强约束生成。
-
-        每行按 line_type（image/feeling/contrast/closure）+ intent 生成。
+        诗歌生成 —— 单次 LLM 调用生成整首诗。
         """
-        lines = []
+        primary, intensity = emotion_vector.get_primary()
+        emotion_context = emotion_vector.to_prompt_context()
 
-        for item in dsl:
+        # 构建结构描述
+        structure_parts = []
+        line_type_labels = {
+            "image": "意象/画面",
+            "contrast": "对比/反转",
+            "closure": "收束/留白",
+            "feeling": "情感/咏叹",
+        }
+        for i, item in enumerate(dsl):
             line_type = item.get("line_type", "feeling")
             intent = item.get("intent", "")
+            label = line_type_labels.get(line_type, "情感/咏叹")
+            structure_parts.append(f"{i+1}. [{label}] — 创作意图：{intent}")
 
-            if line_type == "image":
-                line = self._generate_poem_node(intent, "image", style_template, emotion_vector)
-            elif line_type == "contrast":
-                line = self._generate_poem_node(intent, "contrast", style_template, emotion_vector)
-            elif line_type == "closure":
-                line = self._generate_poem_node(intent, "closure", style_template, emotion_vector)
-            else:
-                line = self._generate_poem_node(intent, "feeling", style_template, emotion_vector)
+        structure_desc = "\n".join(structure_parts)
 
-            lines.append(line)
+        prompt = f"""根据以下结构生成一首完整诗歌。
 
-        return "\n".join(lines)
+【情绪】{emotion_context}（强度 {intensity:.1f}）
+
+【必须严格遵守的结构】
+{structure_desc}
+
+【创作要求】
+- 每行的内容必须真正体现其"创作意图"
+- 诗歌语言精炼，有意象、有留白
+- 情绪贯穿全篇，统一自然
+- 禁止口号式结尾
+
+【输出格式】
+直接输出诗歌正文，每行一行，不要输出任何解释。
+
+诗歌："""
+
+        try:
+            result = llm(prompt, temp=0.8).strip()
+            return result
+        except Exception:
+            return "算了 我不写了"
 
     def _generate_lyrics_node(self, intent: str, section: str,
                               style_template: StyleTemplate,

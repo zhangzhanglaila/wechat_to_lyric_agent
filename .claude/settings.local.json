@@ -31,7 +31,9 @@
       "Bash(pkill -f \"uvicorn\")",
       "Bash(curl -s http://localhost:8006/api/test_llm)",
       "Bash(timeout 180 bash -c ':*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(echo \"PID: $!\")"
     ]
   }
 }
