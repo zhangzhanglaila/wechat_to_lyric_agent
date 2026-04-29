@@ -21,6 +21,7 @@ from agent_os.integration import (
     CandidateScorer,
 )
 from agent_os.art_layer import EmotionVector
+from agent_os.art_layer import llm_stream
 
 _EOS = None
 _EOS_LOCK = threading.Lock()
@@ -75,6 +76,167 @@ def _emit(step: str, msg: str, data, elapsed: float) -> dict:
     if data is not None:
         payload["data"] = data
     return payload
+
+
+def _style_label(style: str, mode: str) -> str:
+    labels = {
+        "douyin_sad": "抖音伤感",
+        "rap": "中文说唱",
+        "emo_pop": "Emo流行",
+        "pop": "流行",
+        "modern": "现代诗",
+        "classical": "古典诗",
+        "imagist": "意象派",
+        "diary": "日记体",
+    }
+    if style:
+        return labels.get(style, style)
+    return "现代诗" if mode == "poem" else "中文说唱"
+
+
+def _build_fast_prompt(req, constraints: dict) -> str:
+    style = _style_label(req.style, req.mode)
+    density = constraints.get("lyric_density") or "short"
+    expression = constraints.get("expression") or "direct"
+    density_rule = {
+        "short": "短句为主，每行 5-10 字",
+        "medium": "中等句长，每行 10-15 字",
+        "long": "长句为主，每行 15-20 字",
+    }.get(density, "短句为主，每行 5-10 字")
+    expression_rule = {
+        "direct": "直给、口语化、情绪明确",
+        "metaphor": "用具体意象表达，但不能偏离输入主题",
+        "self_mock": "可以自嘲、幽默、带一点反差",
+    }.get(expression, "直给、口语化、情绪明确")
+
+    if req.mode == "poem":
+        structure = "自由分行，6-10 行"
+        role = "你是一个专业中文诗歌创作助手。"
+        language_rule = "语言克制、具体、有画面感"
+    else:
+        structure = "【开场】\n【主歌】\n【Hook】"
+        role = "你是一个专业中文歌词创作助手，尤其擅长中文说唱和短句流行歌词。"
+        language_rule = "口语化、有节奏感；如果输入允许，可以带攻击性、幽默或反讽"
+
+    return f"""{role}
+
+【输入主题】
+{req.text}
+
+【硬性要求】
+- 必须围绕输入语义，不得偏离
+- 风格：{style}
+- 表达：{expression_rule}
+- 句式：{density_rule}
+- {language_rule}
+- 禁止无故生成伤感情歌；只有输入本身表达伤感时才使用伤感情绪
+- 不要输出解释、分析、前言或 Markdown 代码块
+
+【结构】
+{structure}
+
+【输出】
+直接输出正文："""
+
+
+def _extract_hook_text(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        if "【Hook】" in line or "[Hook]" in line:
+            return line.replace("【Hook】", "").replace("[Hook]", "").strip()
+    return lines[-1] if lines else ""
+
+
+def _score_text(text: str, hook: str, mode: str) -> tuple:
+    try:
+        scorer = CandidateScorer()
+        dummy = type("obj", (object,), {
+            "type": mode,
+            "text": text,
+            "hook": hook,
+            "structure_dsl": [],
+            "emotion": "theme",
+            "emotion_intensity": 0.5,
+            "score": 0.0,
+            "score_details": {},
+        })()
+        return scorer.score(dummy)
+    except Exception:
+        return 0.0, {}
+
+
+async def _stream_fast_generate(req, constraints: dict):
+    t0 = time.time()
+
+    def emit(step, msg, data=None):
+        return _emit(step, msg, data, time.time() - t0)
+
+    yield emit("prompt", "构造 prompt", {
+        "mode": "fast",
+        "style": _style_label(req.style, req.mode),
+    })
+    await asyncio.sleep(0)
+
+    prompt = _build_fast_prompt(req, constraints)
+    text_chunks = []
+    first_token_at = None
+
+    yield emit("llm", "LLM 流式生成中...", None)
+    await asyncio.sleep(0)
+
+    async for token in llm_stream(prompt, temp=0.75):
+        if first_token_at is None:
+            first_token_at = time.time() - t0
+        text_chunks.append(token)
+        yield _emit("token", "", {
+            "candidate_index": 1,
+            "total": 1,
+            "partial_text": "".join(text_chunks),
+            "first_token": round(first_token_at, 2),
+        }, time.time() - t0)
+        await asyncio.sleep(0)
+
+    text = "".join(text_chunks).strip()
+    hook = _extract_hook_text(text)
+    score, details = _score_text(text, hook, req.mode)
+
+    yield emit("final", "生成完成", {
+        "mode": req.mode,
+        "path": "fast",
+        "style": _style_label(req.style, req.mode),
+        "emotion": "direct_prompt",
+        "emotion_intensity": constraints.get("intensity", 0.0),
+        "baseline_text": "",
+        "baseline_hook": "",
+        "baseline_score": 0.0,
+        "baseline_score_details": {},
+        "optimized_text": text,
+        "optimized_hook": hook,
+        "optimized_score": score,
+        "optimized_score_details": details,
+        "delta": 0.0,
+        "explanation": {
+            "emotion_arc": "fast_path",
+            "style_decisions": {
+                "style": _style_label(req.style, req.mode),
+                "expression": constraints.get("expression"),
+                "lyric_density": constraints.get("lyric_density"),
+            },
+            "structure_type": "single_llm_stream",
+            "hook_strategy": "prompt constrained",
+            "objective_weights": constraints.get("weights"),
+            "optimization_steps": [],
+            "final_refine_steps": 0,
+        },
+        "candidates": [
+            {"index": 1, "text": text, "score": score, "hook": hook}
+        ],
+        "observability": {
+            "first_token": round(first_token_at or 0.0, 2),
+            "total_elapsed": round(time.time() - t0, 2),
+            "llm_calls": 1,
+        },
+    })
 
 
 # ==================== 核心生成逻辑 ====================
@@ -265,9 +427,15 @@ async def stream_generate_async(req):
         return _emit(step, msg, data, time.time() - t0)
 
     try:
-        eos = _get_eos()
         gen_mode = GenerationMode.LYRICS if req.mode == "lyrics" else GenerationMode.POEM
         constraints = _build_constraints(req)
+
+        if not getattr(req, "advanced_mode", False):
+            async for evt in _stream_fast_generate(req, constraints):
+                yield evt
+            return
+
+        eos = _get_eos()
 
         # ===== Step 1: parse =====
         yield emit("parse", "解析输入...", {"input": req.text[:50]})

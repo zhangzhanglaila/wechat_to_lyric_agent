@@ -14,6 +14,7 @@ class GenerateRequest(BaseModel):
     beam_width: int = Field(default=2, ge=1, le=4)
     candidates: int = Field(default=1, ge=1, le=6)
     max_refine_steps: int = Field(default=0, ge=0, le=5)
+    advanced_mode: bool = Field(default=False, description="是否启用高级优化链（多候选/rerank/refine）")
     explain: bool = Field(default=True)
     include_baseline: bool = Field(default=False, description="是否包含 baseline 对比（默认关闭）")
     weights: Optional[Dict[str, float]] = Field(default=None, description="自定义目标函数权重")

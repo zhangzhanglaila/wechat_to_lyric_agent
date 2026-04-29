@@ -13,7 +13,7 @@
               GenWriter Agent
             </h1>
             <p class="text-xs text-text-tertiary">
-              可控歌词/诗歌生成 — LLM + 搜索优化
+              Fast Path 默认流式生成，高级模式按需优化
             </p>
           </div>
         </div>
@@ -26,11 +26,11 @@
           </button>
           <div class="flex items-center gap-1.5 text-xs text-text-tertiary">
             <span class="tag">v1.0</span>
-            <span>beam search</span>
+            <span>SSE streaming</span>
             <span>·</span>
-            <span>DSL</span>
+            <span>fast path</span>
             <span>·</span>
-            <span>multi-candidate</span>
+            <span>optional rerank</span>
           </div>
         </div>
       </div>
@@ -121,6 +121,12 @@
               </select>
             </div>
 
+            <label class="flex items-center gap-2.5 cursor-pointer py-1">
+              <input type="checkbox" v-model="advancedMode"
+                     class="w-4 h-4 rounded border-border-light bg-gray-50 text-bilibili-blue focus:ring-bilibili-blue/30" />
+              <span class="text-sm text-text-secondary">优化模式（多候选 / rerank / refine）</span>
+            </label>
+
             <!-- Sliders row -->
             <div class="grid grid-cols-2 gap-4">
               <div>
@@ -131,7 +137,7 @@
                 <input type="range" v-model="intensity" min="0" max="1" step="0.1"
                        class="w-full accent-bilibili-blue" />
               </div>
-              <div>
+              <div v-if="advancedMode">
                 <label class="text-xs text-text-tertiary mb-1.5 flex justify-between">
                   <span>Beam Width</span>
                   <span class="text-bilibili-blue font-bold">{{ beamWidth }}</span>
@@ -139,7 +145,7 @@
                 <input type="range" v-model="beamWidth" min="1" max="4" step="1"
                        class="w-full accent-bilibili-blue" />
               </div>
-              <div>
+              <div v-if="advancedMode">
                 <label class="text-xs text-text-tertiary mb-1.5 flex justify-between">
                   <span>最大优化</span>
                   <span class="text-bilibili-blue font-bold">{{ maxRefine }}</span>
@@ -147,7 +153,7 @@
                 <input type="range" v-model="maxRefine" min="0" max="5" step="1"
                        class="w-full accent-bilibili-blue" />
               </div>
-              <div>
+              <div v-if="advancedMode">
                 <label class="text-xs text-text-tertiary mb-1.5 flex justify-between">
                   <span>候选数</span>
                   <span class="text-bilibili-blue font-bold">{{ candidates }}</span>
@@ -172,6 +178,18 @@
 
         <!-- Pipeline Live View -->
         <LivePipeline v-if="loading || pipelineSteps.length > 0" :steps="pipelineSteps" />
+
+        <div v-if="loading || streamingText"
+             class="bg-white rounded-2xl shadow-card p-5 border border-border-light">
+          <div class="flex items-center gap-2 mb-4">
+            <div class="w-1 h-3 bg-bilibili-blue rounded-full"></div>
+            <span class="text-xs font-semibold text-text-secondary uppercase tracking-widest">Live Output</span>
+            <span class="ml-auto text-xs text-text-tertiary">
+              生成中 {{ elapsedSeconds.toFixed(1) }}s
+            </span>
+          </div>
+          <p class="min-h-32 text-sm leading-7 text-text-primary whitespace-pre-wrap">{{ streamingText || '正在等待首 token...' }}</p>
+        </div>
 
         <!-- Final Results -->
         <ResultComparison v-if="result" :result="result" />
@@ -215,11 +233,15 @@ const intensity = ref(0.8)
 const beamWidth = ref(2)
 const maxRefine = ref(0)
 const candidates = ref(1)
+const advancedMode = ref(false)
 const explain = ref(true)
 
 const loading = ref(false)
 const pipelineSteps = ref([])
 const result = ref(null)
+const streamingText = ref('')
+const elapsedSeconds = ref(0)
+let elapsedTimer = null
 const llmStatus = ref('unknown')
 const llmStatusText = ref('LLM 状态')
 const llmLoading = ref(false)
@@ -251,6 +273,12 @@ async function generate() {
   loading.value = true
   pipelineSteps.value = []
   result.value = null
+  streamingText.value = ''
+  elapsedSeconds.value = 0
+  const startedAt = performance.now()
+  elapsedTimer = window.setInterval(() => {
+    elapsedSeconds.value = (performance.now() - startedAt) / 1000
+  }, 100)
 
   const payload = {
     text: inputText.value,
@@ -260,8 +288,9 @@ async function generate() {
     expression: expression.value || undefined,
     lyric_density: lyricDensity.value || undefined,
     beam_width: parseInt(beamWidth.value),
-    candidates: parseInt(candidates.value),
-    max_refine_steps: parseInt(maxRefine.value),
+    candidates: advancedMode.value ? parseInt(candidates.value) : 1,
+    max_refine_steps: advancedMode.value ? parseInt(maxRefine.value) : 0,
+    advanced_mode: advancedMode.value,
     explain: explain.value,
   }
 
@@ -296,6 +325,9 @@ async function generate() {
         try {
           const evt = JSON.parse(line.slice(6))
           if (evt.step === 'error') throw new Error(evt.msg)
+          if (evt.step === 'token') {
+            streamingText.value = evt.data?.partial_text || streamingText.value
+          }
 
           // 分发步骤（去重更新）
           const existing = pipelineSteps.value.findIndex(
@@ -309,6 +341,7 @@ async function generate() {
 
           if (evt.step === 'final') {
             result.value = evt.data
+            streamingText.value = evt.data?.optimized_text || streamingText.value
           }
         } catch (parseErr) {
           if (parseErr.message !== '') console.warn('Parse error:', parseErr)
@@ -320,6 +353,10 @@ async function generate() {
     pipelineSteps.value.push({ step: 'error', msg: '生成失败: ' + err.message })
   } finally {
     loading.value = false
+    if (elapsedTimer) {
+      window.clearInterval(elapsedTimer)
+      elapsedTimer = null
+    }
   }
 }
 </script>

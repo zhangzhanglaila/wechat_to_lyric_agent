@@ -84,6 +84,7 @@ const lastElapsed = computed(() => {
 })
 
 const STEP_ORDER = [
+  'prompt', 'llm', 'token',
   'parse', 'emotion', 'dsl', 'dsl_done',
   'candidates', 'candidate_partial',
   'rank',
@@ -112,6 +113,9 @@ const stepNameColor = (evt) => {
 const formatStepName = (step) => {
   const map = {
     'parse': '01 Parse',
+    'prompt': '01 Prompt',
+    'llm': '02 LLM',
+    'token': '02 Token',
     'emotion': '02 Emotion',
     'dsl': '03 DSL',
     'dsl_done': '03 DSL ✓',

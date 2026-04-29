@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from backend.schemas.generate import GenerateRequest, GenerateResponse
 from backend.services.generator import stream_generate_async
@@ -34,8 +34,11 @@ async def generate(req: GenerateRequest):
     """同步生成接口（保留兼容）"""
     final_event = None
     async for evt in stream_generate_async(req):
-        final_event = evt
-    return {"status": "ok"}
+        if evt.get("step") == "final":
+            final_event = evt
+        elif evt.get("step") == "error":
+            raise HTTPException(status_code=500, detail=evt.get("msg", "生成失败"))
+    return final_event["data"] if final_event else {}
 
 
 @router.post("/generate/stream")
