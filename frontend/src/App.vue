@@ -68,6 +68,13 @@
               </svg>
               <span>{{ loading ? '生成中...' : '▶ 生成' }}</span>
             </button>
+            <button @click="sing" :disabled="singing || !streamingText.trim()"
+                    class="flex items-center justify-center gap-1.5 bg-bilibili-pink hover:bg-bilibili-pink/90 text-white rounded-lg px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+              <svg v-if="singing" class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" stroke-dasharray="20 40" stroke-linecap="round"/>
+              </svg>
+              <span>{{ singing ? '演唱中...' : '🎤 Sing' }}</span>
+            </button>
           </div>
         </div>
 
@@ -223,6 +230,27 @@
         <!-- Explanation -->
         <ExplanationPanel v-if="result && result.explanation" :explanation="result.explanation" />
 
+        <!-- Sing Pipeline -->
+        <LivePipeline v-if="singing || singPipelineSteps.length > 0" :steps="singPipelineSteps" />
+
+        <!-- Audio Player -->
+        <div v-if="audioUrl"
+             class="bg-white rounded-2xl shadow-card p-5 border border-border-light">
+          <div class="flex items-center gap-2 mb-3">
+            <div class="w-1 h-3 bg-bilibili-pink rounded-full"></div>
+            <span class="text-xs font-semibold text-text-secondary uppercase tracking-widest">Audio Player</span>
+            <span class="ml-auto text-xs text-text-tertiary">{{ singFilename }}</span>
+          </div>
+          <audio ref="audioPlayer" :src="audioUrl" controls class="w-full rounded-lg"></audio>
+        </div>
+
+        <!-- Sing Error -->
+        <div v-if="singErrorMessage"
+             class="bg-red-50 border border-red-200 rounded-2xl p-4 text-sm text-red-600">
+          <div class="font-semibold mb-1">演唱失败</div>
+          <div>{{ singErrorMessage }}</div>
+        </div>
+
         <!-- Empty state -->
         <div v-if="!loading && pipelineSteps.length === 0 && !result"
              class="bg-white rounded-2xl shadow-card p-12 flex flex-col items-center gap-5 text-center">
@@ -273,6 +301,14 @@ let elapsedTimer = null
 const llmStatus = ref('unknown')
 const llmStatusText = ref('LLM 状态')
 const llmLoading = ref(false)
+
+// Sing state
+const singing = ref(false)
+const singPipelineSteps = ref([])
+const audioUrl = ref('')
+const singFilename = ref('')
+const singErrorMessage = ref('')
+const audioPlayer = ref(null)
 
 async function testLLM() {
   llmLoading.value = true
@@ -401,6 +437,85 @@ async function generate() {
       window.clearInterval(elapsedTimer)
       elapsedTimer = null
     }
+  }
+}
+
+async function sing() {
+  if (!streamingText.value.trim() || singing.value) return
+
+  singing.value = true
+  singPipelineSteps.value = []
+  audioUrl.value = ''
+  singFilename.value = ''
+  singErrorMessage.value = ''
+
+  const payload = {
+    lyrics: streamingText.value,
+    style: style.value,
+    mode: 'full',
+    instrumental_volume: 0.4,
+    vocal_volume: 0.8,
+  }
+
+  try {
+    const resp = await fetch('/api/sing/stream', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    })
+
+    if (!resp.ok) {
+      const err = await resp.text()
+      throw new Error(`HTTP ${resp.status}: ${err}`)
+    }
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        let evt
+        try {
+          evt = JSON.parse(line.slice(6))
+        } catch {
+          continue
+        }
+
+        // 更新pipeline步骤
+        const existing = singPipelineSteps.value.findIndex(s => s.step === evt.step)
+        if (existing >= 0) {
+          singPipelineSteps.value[existing] = evt
+        } else {
+          singPipelineSteps.value.push(evt)
+        }
+
+        if (evt.step === 'error') {
+          singErrorMessage.value = evt.msg || '演唱失败'
+          singing.value = false
+          try { await reader.cancel() } catch {}
+          return
+        }
+
+        if (evt.step === 'final' && evt.data) {
+          audioUrl.value = evt.data.audio_url || ''
+          singFilename.value = evt.data.filename || ''
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Sing failed:', err)
+    singErrorMessage.value = err.message
+  } finally {
+    singing.value = false
   }
 }
 </script>

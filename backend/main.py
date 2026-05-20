@@ -4,13 +4,14 @@ GenWriter Agent - FastAPI Backend
 import os
 from dotenv import load_dotenv
 
-# 显式加载 .env，确保子进程也能读到环境变量
-load_dotenv()
+# 显式加载 .env，确保子进程也能读到环境变量（override=True 优先使用 .env）
+load_dotenv(override=True)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from backend.api.generate import router as generate_router
+from backend.api.sing import router as sing_router
 
 app = FastAPI(
     title="GenWriter Agent API",
@@ -30,6 +31,11 @@ app.add_middleware(
 )
 
 app.include_router(generate_router)
+app.include_router(sing_router)
+
+# 输出目录静态文件服务（音频文件）
+output_dir = os.path.join(os.path.dirname(__file__), "..", "output")
+os.makedirs(os.path.join(output_dir, "sing"), exist_ok=True)
 
 # 前端静态文件（打包后）
 dist_dir = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
@@ -44,7 +50,7 @@ else:
 if __name__ == "__main__":
     import uvicorn
     print()
-    print("🚀  GenWriter Agent")
+    print("GenWriter Agent")
     print("   Server:  http://localhost:8000")
     print("   API:     http://localhost:8000/docs")
     print()

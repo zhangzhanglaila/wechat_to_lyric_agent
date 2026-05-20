@@ -206,8 +206,16 @@ async def _stream_fast_generate(req, constraints: dict, request_id: str):
     await asyncio.sleep(0)
 
     try:
-        async with asyncio.timeout(FAST_PATH_TIMEOUT_SECONDS):
+        async def _stream_with_timeout():
             async for token in llm_stream(prompt, temp=0.75):
+                yield token
+
+        stream = _stream_with_timeout()
+        deadline = time.time() + FAST_PATH_TIMEOUT_SECONDS
+        try:
+            async for token in stream:
+                if time.time() > deadline:
+                    raise asyncio.TimeoutError()
                 if first_token_at is None:
                     first_token_at = time.time() - t0
                     _log_generation(
@@ -225,7 +233,9 @@ async def _stream_fast_generate(req, constraints: dict, request_id: str):
                     "first_token": round(first_token_at, 2),
                 }, time.time() - t0)
                 await asyncio.sleep(0)
-    except TimeoutError:
+        except StopAsyncIteration:
+            pass
+    except asyncio.TimeoutError:
         elapsed = time.time() - t0
         _log_generation(
             request_id, "timeout",
@@ -238,15 +248,18 @@ async def _stream_fast_generate(req, constraints: dict, request_id: str):
         }, elapsed)
         return
     except Exception as e:
+        import traceback
         elapsed = time.time() - t0
+        tb = traceback.format_exc()
         _log_generation(
             request_id, "failed",
-            path="fast", elapsed=round(elapsed, 2), error=str(e),
+            path="fast", elapsed=round(elapsed, 2), error=str(e), traceback=tb,
         )
         yield _emit("error", f"LLM 调用失败: {e}", {
             "request_id": request_id,
             "code": "LLM_ERROR",
             "elapsed": round(elapsed, 2),
+            "traceback": tb,
         }, elapsed)
         return
 

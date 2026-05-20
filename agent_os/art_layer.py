@@ -36,7 +36,7 @@ from enum import Enum, auto
 from dotenv import load_dotenv
 
 # ==================== Config ====================
-load_dotenv()
+load_dotenv(override=True)
 
 API_KEY = os.getenv("OPENAI_API_KEY")
 API_BASE = os.getenv("OPENAI_API_BASE", "https://api.deepseek.com/v1")

@@ -33,7 +33,13 @@
       "Bash(timeout 180 bash -c ':*)",
       "Bash(curl:*)",
       "Bash(taskkill //F //IM python.exe)",
-      "Bash(echo \"PID: $!\")"
+      "Bash(echo \"PID: $!\")",
+      "Bash(pip install *)",
+      "Bash(pkill -f \"backend.main\")",
+      "Bash(python -m backend.main)",
+      "Bash(pkill -f uvicorn)",
+      "Bash(python -c ' *)",
+      "Bash(pkill -f \"python -c\")"
     ]
   }
 }
