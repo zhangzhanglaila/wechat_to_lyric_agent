@@ -39,7 +39,19 @@
       "Bash(python -m backend.main)",
       "Bash(pkill -f uvicorn)",
       "Bash(python -c ' *)",
-      "Bash(pkill -f \"python -c\")"
+      "Bash(pkill -f \"python -c\")",
+      "Bash(lsof -ti:8002)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill *)",
+      "Bash(sort -k6,7)",
+      "Bash(taskkill //F //PID 18352)",
+      "Bash(python -c \"import uvicorn; uvicorn.run\\('backend.main:app', host='0.0.0.0', port=8002, reload=False\\)\")",
+      "Bash(grep -E \"\\\\.wav$|\\\\.mid$\")",
+      "Bash(grep -E \"\\\\.mid$\")",
+      "Bash(grep -E \"\\\\.mid$|_inst\")",
+      "WebSearch",
+      "mcp__MiniMax__web_search",
+      "Bash(xxd)"
     ]
   }
 }

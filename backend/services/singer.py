@@ -152,23 +152,30 @@ async def stream_sing_async(req):
             yield emit("synth", "伴奏合成完成", {"path": instrumental_path})
             await asyncio.sleep(0)
 
-        # ===== Step 5: TTS人声 =====
+        # ===== Step 5: TTS人声（逐字+音高匹配） =====
         vocal_paths = []
+        vocal_combined_path = None
         if req.mode != "instrumental":
-            yield emit("tts", "生成TTS人声...")
+            yield emit("tts", "逐行TTS合成中（native pitch + 逐音符切片）...")
 
             vocal_dir = tempfile.mkdtemp(prefix=f"sing_{request_id}_")
             temp_files.append(vocal_dir)
 
-            vocal_paths = await VocalGenerator.generate_vocals(
-                req.lyrics, emotion, req.style,
+            vocal_combined_path = await VocalGenerator.generate_singing_vocals(
+                melody, req.lyrics, emotion, req.style,
                 voice_override=req.voice,
                 output_dir=vocal_dir,
             )
 
-            yield emit("tts", f"人声生成完成: {len(vocal_paths)}段", {
-                "segment_count": len(vocal_paths),
-            })
+            if vocal_combined_path and os.path.exists(vocal_combined_path):
+                vocal_paths = [vocal_combined_path]
+                logger.info(f"Vocal generated: {vocal_combined_path}, exists={os.path.exists(vocal_combined_path)}")
+                yield emit("tts", f"人声生成完成（native pitch + 微调）", {
+                    "vocal_path": vocal_combined_path,
+                })
+            else:
+                logger.warning(f"Vocal generation failed: path={vocal_combined_path}")
+                yield emit("tts", "人声生成失败")
             await asyncio.sleep(0)
 
         # ===== Step 6: 混音 =====
@@ -177,6 +184,10 @@ async def stream_sing_async(req):
         output_ext = ".wav"  # WAV总是可用
         output_filename = f"{request_id}{output_ext}"
         output_path = os.path.join(SING_OUTPUT_DIR, output_filename)
+
+        logger.info(f"Mix: mode={req.mode}, instrumental_path={instrumental_path}, vocal_paths={vocal_paths}")
+        logger.info(f"Mix: instrumental_path exists={os.path.exists(instrumental_path) if instrumental_path else False}")
+        logger.info(f"Mix: vocal_paths count={len(vocal_paths)}")
 
         if req.mode == "vocal_only" and vocal_paths:
             result_path = await asyncio.to_thread(
