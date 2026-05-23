@@ -152,30 +152,49 @@ async def stream_sing_async(req):
             yield emit("synth", "伴奏合成完成", {"path": instrumental_path})
             await asyncio.sleep(0)
 
-        # ===== Step 5: TTS人声（逐字+音高匹配） =====
+        # ===== Step 5: 人声生成（TTS或合成歌声） =====
         vocal_paths = []
         vocal_combined_path = None
         if req.mode != "instrumental":
-            yield emit("tts", "逐行TTS合成中（native pitch + 逐音符切片）...")
-
             vocal_dir = tempfile.mkdtemp(prefix=f"sing_{request_id}_")
             temp_files.append(vocal_dir)
 
-            vocal_combined_path = await VocalGenerator.generate_singing_vocals(
-                melody, req.lyrics, emotion, req.style,
-                voice_override=req.voice,
-                output_dir=vocal_dir,
-            )
+            if req.mode == "synth":
+                # 合成歌声模式（波表+共振峰+颤音）
+                yield emit("tts", "合成歌声生成中（波表合成+共振峰滤波）...")
 
-            if vocal_combined_path and os.path.exists(vocal_combined_path):
-                vocal_paths = [vocal_combined_path]
-                logger.info(f"Vocal generated: {vocal_combined_path}, exists={os.path.exists(vocal_combined_path)}")
-                yield emit("tts", f"人声生成完成（native pitch + 微调）", {
-                    "vocal_path": vocal_combined_path,
-                })
+                vocal_combined_path = await VocalGenerator.generate_synth_singing(
+                    melody, req.lyrics, emotion, req.style,
+                    output_dir=vocal_dir,
+                )
+
+                if vocal_combined_path and os.path.exists(vocal_combined_path):
+                    vocal_paths = [vocal_combined_path]
+                    yield emit("tts", "合成歌声生成完成", {
+                        "vocal_path": vocal_combined_path,
+                        "mode": "synth",
+                    })
+                else:
+                    yield emit("tts", "合成歌声生成失败")
             else:
-                logger.warning(f"Vocal generation failed: path={vocal_combined_path}")
-                yield emit("tts", "人声生成失败")
+                # TTS人声模式（edge-tts）
+                yield emit("tts", "逐行TTS合成中（native pitch + 逐音符切片）...")
+
+                vocal_combined_path = await VocalGenerator.generate_singing_vocals(
+                    melody, req.lyrics, emotion, req.style,
+                    voice_override=req.voice,
+                    output_dir=vocal_dir,
+                )
+
+                if vocal_combined_path and os.path.exists(vocal_combined_path):
+                    vocal_paths = [vocal_combined_path]
+                    logger.info(f"Vocal generated: {vocal_combined_path}")
+                    yield emit("tts", f"人声生成完成（native pitch + 微调）", {
+                        "vocal_path": vocal_combined_path,
+                    })
+                else:
+                    logger.warning(f"Vocal generation failed: path={vocal_combined_path}")
+                    yield emit("tts", "人声生成失败")
             await asyncio.sleep(0)
 
         # ===== Step 6: 混音 =====

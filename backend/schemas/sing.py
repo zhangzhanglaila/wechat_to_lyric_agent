@@ -8,7 +8,7 @@ class SingRequest(BaseModel):
     style: str = Field(default="heartbreak", description="风格预设名称")
     voice: str = Field(default="", description="TTS声音（空=自动选择）")
     tempo: int = Field(default=0, ge=0, le=200, description="BPM（0=使用风格默认值）")
-    mode: str = Field(default="full", description="模式: full(人声+伴奏) / instrumental(纯伴奏) / vocal_only(纯人声)")
+    mode: str = Field(default="full", description="模式: full(人声+伴奏) / instrumental(纯伴奏) / vocal_only(纯人声) / synth(合成歌声+伴奏)")
     instrumental_volume: float = Field(default=0.8, ge=0.0, le=1.0, description="伴奏音量")
     vocal_volume: float = Field(default=0.7, ge=0.0, le=1.0, description="人声音量")
 

@@ -314,6 +314,174 @@ class VocalGenerator:
         return f"{offset:+.0f}Hz"
 
     @staticmethod
+    def _generate_synth_note(frequency: float, duration: float, sr: int = 24000,
+                              formant_freq: float = 800.0, vibrato_depth: float = 0.02) -> np.ndarray:
+        """
+        生成单个合成音符（波表+共振峰+颤音）
+
+        Args:
+            frequency: 基频频率 (Hz)
+            duration: 时长 (秒)
+            sr: 采样率
+            formant_freq: 共振峰频率 (Hz)
+            vibrato_depth: 颤音深度 (0-0.1)
+        """
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+
+        # 基频 + 泛音（模拟人声的谐波结构）
+        signal = np.sin(2 * np.pi * frequency * t)  # 基频
+        signal += 0.5 * np.sin(2 * np.pi * 2 * frequency * t)  # 2次谐波
+        signal += 0.25 * np.sin(2 * np.pi * 3 * frequency * t)  # 3次谐波
+        signal += 0.125 * np.sin(2 * np.pi * 4 * frequency * t)  # 4次谐波
+
+        # 颤音（vibrato）
+        vibrato = 1 + vibrato_depth * np.sin(2 * np.pi * 5 * t)  # 5Hz颤音
+        signal = signal * vibrato
+
+        # 共振峰滤波（简化版 - 用带通滤波模拟）
+        # 人声共振峰：F1≈500Hz, F2≈1500Hz, F2≈2500Hz
+        formant1 = np.sin(2 * np.pi * formant_freq * t)
+        formant2 = np.sin(2 * np.pi * (formant_freq * 2) * t)
+        signal = signal * 0.7 + formant1 * 0.2 + formant2 * 0.1
+
+        # 包络（ADSR）
+        attack = int(0.05 * sr)  # 50ms attack
+        decay = int(0.1 * sr)  # 100ms decay
+        release = int(0.1 * sr)  # 100ms release
+
+        envelope = np.ones(len(signal))
+        # Attack
+        if attack > 0:
+            envelope[:attack] = np.linspace(0, 1, attack)
+        # Decay
+        if decay > 0:
+            envelope[attack:attack+decay] = np.linspace(1, 0.8, decay)
+        # Release
+        if release > 0 and release < len(envelope):
+            envelope[-release:] = np.linspace(0.8, 0, release)
+
+        signal = signal * envelope
+
+        # 归一化
+        max_val = np.max(np.abs(signal))
+        if max_val > 0:
+            signal = signal / max_val * 0.8
+
+        return signal
+
+    @staticmethod
+    async def generate_synth_singing(melody, lyrics: str, emotion: str, style: str,
+                                      voice_override: str = "", output_dir: str = "") -> str:
+        """
+        合成歌声（v13 - 波表合成+共振峰+颤音）。
+
+        核心策略：
+        1. 每个音符生成对应频率的合成波形
+        2. 应用共振峰滤波模拟人声
+        3. 添加颤音（vibrato）增加自然感
+        4. 按歌词顺序拼接音符
+
+        效果：类似电子合成器的"歌唱"，有明确的音高变化
+        """
+        import wave
+
+        if not output_dir:
+            output_dir = tempfile.mkdtemp(prefix="sing_synth_")
+
+        sr = 24000
+
+        # 去掉结构标记，提取歌词
+        raw_lines = [line.strip() for line in lyrics.split("\n") if line.strip()]
+        clean_text = ""
+        for line in raw_lines:
+            clean = re.sub(r"[【\[][^】\]]*[】\]]", "", line).strip()
+            if clean:
+                clean_text += clean
+
+        if not clean_text:
+            raise ValueError("没有有效歌词")
+
+        # 提取所有字符
+        chars = [c for c in clean_text if c.strip() and c not in '，。！？、；：""''…— ']
+
+        # 为每个字符分配音符
+        all_segments = []
+        note_idx = 0
+
+        for char in chars:
+            if note_idx >= len(melody.notes):
+                break
+
+            note = melody.notes[note_idx]
+            note_idx += 1
+
+            # 跳过休止符
+            while note_idx < len(melody.notes) and note.is_rest:
+                note = melody.notes[note_idx]
+                note_idx += 1
+
+            if note.is_rest:
+                continue
+
+            # 计算频率
+            if isinstance(note.pitch, str):
+                midi_num = pitch_to_midi(note.pitch)
+            else:
+                midi_num = note.pitch
+
+            if midi_num <= 0:
+                continue
+
+            frequency = 440.0 * (2.0 ** ((midi_num - 69) / 12.0))
+
+            # 计算时长
+            beat_duration = 60.0 / melody.bpm
+            note_duration = note.duration * beat_duration
+
+            # 生成合成音符
+            synth_note = VocalGenerator._generate_synth_note(
+                frequency, note_duration, sr,
+                formant_freq=800 + (midi_num - 60) * 10,  # 共振峰随音高变化
+                vibrato_depth=0.03
+            )
+
+            all_segments.append(synth_note)
+
+            # 添加小间隔
+            gap = np.zeros(int(0.02 * sr))
+            all_segments.append(gap)
+
+        if not all_segments:
+            raise ValueError("没有生成有效的合成音符")
+
+        # 拼接所有音符
+        combined = np.concatenate(all_segments)
+
+        # 添加整体包络
+        fade_in = int(0.1 * sr)
+        fade_out = int(0.2 * sr)
+        if fade_in > 0:
+            combined[:fade_in] *= np.linspace(0, 1, fade_in)
+        if fade_out > 0:
+            combined[-fade_out:] *= np.linspace(1, 0, fade_out)
+
+        # 归一化
+        max_val = np.max(np.abs(combined))
+        if max_val > 0:
+            combined = combined / max_val * 0.85
+
+        # 保存WAV
+        output_path = os.path.join(output_dir, "synth_singing.wav")
+        audio_16bit = (combined * 32767).astype(np.int16)
+        with wave.open(output_path, "w") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(audio_16bit.tobytes())
+
+        return output_path
+
+    @staticmethod
     async def generate_singing_vocals(melody, lyrics: str, emotion: str, style: str,
                                        voice_override: str = "", output_dir: str = "") -> str:
         """
