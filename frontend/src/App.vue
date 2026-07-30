@@ -10,10 +10,10 @@
           </div>
           <div>
             <h1 class="text-base font-bold text-text-primary tracking-wide">
-              GenWriter Agent
+              WeChat2Song
             </h1>
             <p class="text-xs text-text-tertiary">
-              Fast Path 默认流式生成，高级模式按需优化
+              微信聊天记录 -> 中文歌词 -> 可播放歌曲 demo
             </p>
           </div>
         </div>
@@ -26,11 +26,11 @@
           </button>
           <div class="flex items-center gap-1.5 text-xs text-text-tertiary">
             <span class="tag">v1.0</span>
+            <span>chat to lyrics</span>
+            <span>·</span>
             <span>SSE streaming</span>
             <span>·</span>
-            <span>fast path</span>
-            <span>·</span>
-            <span>optional rerank</span>
+            <span>lyrics to song</span>
           </div>
         </div>
       </div>
@@ -54,7 +54,7 @@
                    resize-none focus:outline-none focus:border-bilibili-blue focus:ring-2 focus:ring-bilibili-blue/20
                    transition-all"
             rows="4"
-            placeholder="输入关键词或聊天记录..."
+            placeholder="粘贴微信聊天记录、关键词或一段故事..."
           />
           <div class="flex gap-2 mt-3">
             <select v-model="mode" class="flex-1 bg-gray-50 border border-border-light rounded-lg px-2 py-1.5 text-xs text-text-secondary">
@@ -149,7 +149,7 @@
                 </button>
               </div>
               <p class="mt-1.5 text-xs text-text-tertiary">
-                {{ advancedMode ? '高质量生成：多候选、重排、精修，耗时更长。' : '默认简易模式：单次 LLM，优先实时反馈。' }}
+                {{ advancedMode ? '高质量生成：多候选、重排、精修，耗时更长。' : '默认模式：先快速把聊天故事写成歌词，再继续生成歌曲 demo。' }}
               </p>
             </div>
 
@@ -262,9 +262,9 @@
             </svg>
           </div>
           <div>
-            <p class="text-text-primary font-medium text-base">GenWriter Agent</p>
-            <p class="text-text-tertiary text-sm mt-1">输入文本，选择参数</p>
-            <p class="text-text-tertiary text-xs mt-0.5">点击「生成」启动创作管线</p>
+            <p class="text-text-primary font-medium text-base">WeChat2Song</p>
+            <p class="text-text-tertiary text-sm mt-1">粘贴聊天记录，生成中文歌词</p>
+            <p class="text-text-tertiary text-xs mt-0.5">生成后点击「Sing」继续合成可播放歌曲</p>
           </div>
         </div>
       </div>

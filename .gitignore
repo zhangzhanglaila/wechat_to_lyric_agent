@@ -1,8 +1,11 @@
-# 环境变量（包含敏感信息）
+# Environment variables
 .env
 
-# Memory 文件（设计文档，不提交）
+# Local assistant / IDE state
 .memory/
+.claude/
+.idea/
+.vscode/
 
 # Python
 __pycache__/
@@ -11,13 +14,35 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.venv/
+venv/
+.pytest_cache/
 
-# IDE
-.vscode/
-.idea/
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Generated media and temporary outputs
+output/
+temp_audio/
+temp_song/
+*.mp3
+*.wav
+*.mid
+*.log
+
+# Local test scratch files
+result.txt
+sse_out.txt
+sse_test*.txt
+stream_api_test.txt
+last_audio_url.txt
+
+# Editor swap
 *.swp
 *.swo
 
-# 其他
+# OS
 .DS_Store
-*.log
+Thumbs.db

@@ -3,12 +3,12 @@ from fastapi.responses import StreamingResponse
 from backend.schemas.generate import GenerateRequest, GenerateResponse
 from backend.services.generator import stream_generate_async
 
-router = APIRouter(prefix="/api", tags=["生成"])
+router = APIRouter(prefix="/api", tags=["歌词生成"])
 
 
 @router.get("/test_llm")
 async def test_llm():
-    """LLM 连通性测试"""
+    """测试 LLM 连通性。"""
     import time
     t0 = time.time()
     try:
@@ -31,7 +31,7 @@ async def test_llm():
 
 @router.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest):
-    """同步生成接口（保留兼容）"""
+    """同步生成接口。"""
     final_event = None
     async for evt in stream_generate_async(req):
         if evt.get("step") == "final":
@@ -43,7 +43,7 @@ async def generate(req: GenerateRequest):
 
 @router.post("/generate/stream")
 async def generate_stream(req: GenerateRequest):
-    """流式生成接口 — SSE。每个 token 实时推送，用户可见打字机效果。"""
+    """SSE 流式生成接口，实时推送生成步骤和 token。"""
     import json
 
     async def event_stream():

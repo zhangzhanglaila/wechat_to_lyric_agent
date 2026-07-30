@@ -1,93 +1,137 @@
-# GenWriter Agent
+# WeChat2Song / GenWriter Agent
 
-一个中文歌词 / 诗歌生成系统，核心目标不是堆复杂 pipeline，而是提供一个**默认可用、响应快、可观测**的 LLM 创作服务。
+把微信聊天记录、关键词或一段故事，一键生成中文歌词，并继续合成可播放的 AI 歌曲 demo。  
+Turn WeChat chat logs, keywords, or a short story into Chinese lyrics, then synthesize a playable AI song demo.
 
-当前架构是双模式：
+> 当前项目包含：FastAPI 后端、Vue Web UI、SSE 流式歌词生成、情绪/风格控制、歌词评分、多候选优化、歌词到 MIDI/TTS/混音的歌曲生成链路。  
+> This project includes a FastAPI backend, Vue Web UI, SSE streaming generation, emotion/style controls, lyric scoring, multi-candidate optimization, and a lyrics-to-MIDI/TTS/mixing song pipeline.
 
-- **简易模式 Simple Mode**：默认路径，单次 LLM + SSE 流式返回，优先保证响应速度和用户体验。
-- **高级模式 Advanced Mode**：可选路径，保留 Emotion → DSL → Generate → Rank → Refine 的多阶段优化链，适合研究和高质量生成。
+## 为什么值得试 / Why Try It
 
----
+- **聊天记录转歌词**：输入微信式聊天文本，自动提取人物关系、情绪和故事线，生成口语化中文歌词。  
+  **Chat logs to lyrics**: Paste WeChat-style conversations and generate conversational Chinese lyrics from the relationship, emotion, and story.
 
-## 功能特性
+- **歌词继续变歌曲**：生成歌词后点击 `Sing`，走旋律生成、MIDI、TTS/合成歌声、混音，输出可播放 WAV。  
+  **Lyrics to song**: After lyrics are generated, click `Sing` to create melody, MIDI, TTS/synthetic vocals, mixing, and a playable WAV file.
 
-### 简易模式（默认）
+- **实时可见**：歌词和歌曲生成过程都通过 SSE 推送，前端能看到 token、pipeline 步骤、耗时和错误信息。  
+  **Live feedback**: Both lyric and song generation stream progress through SSE, including tokens, pipeline steps, latency, and errors.
 
-- 快速生成，目标约 10-20 秒内完成
-- 单次 LLM 调用
-- SSE 流式输出，前端实时显示 token
-- Prompt 强约束输入主题，减少跑偏
-- 适合大多数用户和演示场景
+- **双模式生成**：Simple Mode 默认快速返回；Advanced Mode 提供多候选、重排和精修。  
+  **Two generation modes**: Simple Mode is fast by default; Advanced Mode enables multi-candidate generation, ranking, and refinement.
 
-### 高级模式（可选）
+- **适合中文场景**：内置抖音伤感、中文说唱、Emo 流行、现代诗、古典、日记体等风格。  
+  **Built for Chinese scenarios**: Includes styles such as Douyin sad pop, Chinese rap, emo pop, modern poetry, classical poetry, and diary-like writing.
 
-- 多阶段 pipeline：Emotion → DSL → Generate → Rank → Refine
-- 支持多候选、重排、一次精修
-- 更可控，但更慢，通常约 60-200 秒
-- 适合研究、对比实验和高级用户
+## 效果预览 / Preview
 
----
-
-## 架构
+输入可以是普通关键词，也可以是聊天记录：  
+The input can be plain keywords or chat logs:
 
 ```text
-Client (Vue)
-  ↓ SSE
-Backend (FastAPI)
-  ├─ Simple Mode（默认）
-  │   └─ Prompt 构造 → 单次 LLM Streaming → 实时返回
-  │
-  ├─ Advanced Mode（可选）
-  │   └─ Emotion → DSL → 多候选生成 → Rank → Refine
-  │
-  └─ Observability
-      ├─ step events
-      ├─ token stream
-      ├─ elapsed latency
-      └─ score / candidates
+小明：新年快乐，今年是我们在一起的第三年了
+小红：记得第一次见面是在咖啡店
+小明：你当时穿了一条白裙子
+小红：下周一起去看樱花吧
 ```
 
-默认请求不会进入 AgentOS 复杂链路；只有显式开启 `advanced_mode` 才会走高级 pipeline。
+生成链路：  
+Generation pipeline:
 
----
+```text
+微信聊天记录 / 关键词
+WeChat chat logs / keywords
+  -> 情绪与主题提取 / emotion and theme extraction
+  -> 中文歌词生成 / Chinese lyric generation
+  -> Hook / 结构评分 / hook and structure scoring
+  -> 旋律生成 / melody generation
+  -> MIDI + 人声/TTS / MIDI + vocals/TTS
+  -> 混音输出 WAV / mixed WAV output
+```
 
-## 使用方式
+仓库内提供了一个示例输入：[example_chat.txt](example_chat.txt)。  
+A sample input is included in this repository: [example_chat.txt](example_chat.txt).
 
-### 1. 启动后端
+## 快速开始 / Quick Start
+
+### 1. 配置模型 / Configure Model
+
+复制环境变量示例：  
+Copy the environment template:
+
+```bash
+cp .env.example .env
+```
+
+修改 `.env`：  
+Edit `.env`:
+
+```env
+OPENAI_API_KEY=your-api-key-here
+OPENAI_API_BASE=https://api.deepseek.com/v1
+MODEL_NAME=deepseek-chat
+```
+
+也可以切到 OpenAI 或其他兼容 OpenAI SDK 的服务。  
+You can also switch to OpenAI or any OpenAI SDK-compatible provider.
+
+### 2. 安装后端依赖 / Install Backend Dependencies
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 3. 安装前端依赖 / Install Frontend Dependencies
+
+```bash
+cd frontend
+npm install
+cd ..
+```
+
+### 4. 启动服务 / Start Server
 
 ```bash
 python -m backend.main
 ```
 
-默认服务地址：
+打开：  
+Open:
 
 ```text
 http://localhost:8000
 ```
 
-接口文档：
+接口文档：  
+API docs:
 
 ```text
 http://localhost:8000/docs
 ```
 
-### 2. 启动前端
+如果前端没有显示，请先构建：  
+If the frontend is not served, build it first:
 
 ```bash
 cd frontend
-npm install
+npm run build
+cd ..
+python -m backend.main
+```
+
+开发前端时可以单独运行：  
+For frontend development:
+
+```bash
+cd frontend
 npm run dev
 ```
 
-前端默认进入简易模式，可以在控制面板中切换到高级模式。
+## API 示例 / API Examples
 
----
-
-## API 示例
-
-实际接口前缀是 `/api`。
-
-### 默认：简易模式
+### 流式生成歌词 / Stream Lyrics
 
 ```http
 POST /api/generate/stream
@@ -96,189 +140,112 @@ Content-Type: application/json
 
 ```json
 {
-  "text": "我是你爸爸",
-  "mode": "lyrics",
-  "style": "rap"
-}
-```
-
-特点：
-
-- `advanced_mode` 默认为 `false`
-- 单次 LLM 调用
-- 通过 SSE 持续返回 `token` 事件
-
-### 高级模式
-
-```http
-POST /api/generate/stream
-Content-Type: application/json
-```
-
-```json
-{
-  "text": "我是你爸爸",
+  "text": "分手后的微信聊天记录，最后一句是再也不见",
   "mode": "lyrics",
   "style": "rap",
-  "advanced_mode": true,
-  "candidates": 3,
-  "max_refine_steps": 1,
-  "beam_width": 2
+  "advanced_mode": false
 }
 ```
 
-特点：
-
-- 会进入 AgentOS 多阶段链路
-- 支持多候选、评分、排序、精修
-- 延迟和成本明显高于简易模式
-
-### 同步接口
+### 歌词生成歌曲 / Generate Song From Lyrics
 
 ```http
-POST /api/generate
+POST /api/sing/stream
 Content-Type: application/json
 ```
 
-请求体与 `/api/generate/stream` 相同，但不会逐 token 返回，适合脚本调用。
-
----
-
-## 前端模式切换
-
-控制面板中提供两个模式：
-
-```text
-[ Simple Mode ⚡ ]   [ Advanced Mode ]
-```
-
-### Simple Mode
-
-- 默认开启
-- 秒级反馈
-- 实时显示生成中的正文
-- 隐藏候选数、beam width、refine 等复杂参数
-
-### Advanced Mode
-
-- 手动开启
-- 展示候选数、beam width、最大优化步数
-- 适合需要更高质量或想观察 pipeline 的场景
-
----
-
-## Prompt 策略
-
-简易模式使用强约束 prompt：
-
-```text
-你是一个专业中文歌词创作助手。
-
-【输入主题】
-{user_input}
-
-【硬性要求】
-- 必须围绕输入语义，不得偏离
-- 风格：{style}
-- 语言：口语化、有节奏感
-- 禁止无故生成伤感情歌
-- 不要输出解释、分析、前言
-
-【结构】
-【开场】
-【主歌】
-【Hook】
-
-【输出】
-直接输出正文
-```
-
-这样可以避免模型默认滑向“伤感情歌”等高频分布。
-
----
-
-## 性能目标
-
-| 指标 | 目标 |
-|---|---|
-| 首 token | 尽量 < 2 秒 |
-| 简易模式完整生成 | 约 10-20 秒 |
-| 默认 LLM 调用次数 | 1 |
-| UI 响应 | token 实时展示 |
-| 高级模式完整生成 | 约 60-200 秒 |
-
-实际延迟取决于模型服务、网络和输出长度。
-
----
-
-## 超时与可观测性
-
-后端会为每次生成创建 `request_id`，并在 SSE 事件、最终响应和日志中透出，便于排查问题。
-
-默认超时配置：
-
-| 环境变量 | 默认值 | 说明 |
-|---|---:|---|
-| `FAST_PATH_TIMEOUT_SECONDS` | `60` | Simple Mode 总超时 |
-| `ADVANCED_PATH_TIMEOUT_SECONDS` | `240` | Advanced Mode 总超时 |
-
-日志为结构化 JSON，包含：
-
 ```json
 {
-  "event": "generation",
-  "request_id": "a1b2c3d4e5f6",
-  "status": "completed",
-  "path": "fast",
-  "first_token": 1.42,
-  "total_elapsed": 8.76,
-  "llm_calls": 1
+  "lyrics": "窗外的麻雀 在电线杆上多嘴\n你说这一句 很有夏天的感觉",
+  "style": "rap",
+  "mode": "full",
+  "instrumental_volume": 0.4,
+  "vocal_volume": 0.8
 }
 ```
 
-前端在失败或超时时会展示明确错误和 `Request ID`，不会一直停留在“生成中”。
+返回的 final event 会包含：  
+The final event includes:
 
----
+```json
+{
+  "audio_url": "/api/sing/audio/<filename>.wav",
+  "filename": "<filename>.wav"
+}
+```
 
-## 主要文件
+## 模式说明 / Modes
+
+| 模式 / Mode | 适合场景 / Best For | 特点 / Notes |
+|---|---|---|
+| Simple Mode | 默认体验、演示、低延迟 / default use, demos, low latency | 单次 LLM，SSE 流式输出，优先快速可用 / one LLM call, SSE streaming, optimized for speed |
+| Advanced Mode | 质量对比、研究、调参 / quality comparison, research, tuning | Emotion -> DSL -> 多候选 -> Rank -> Refine / Emotion -> DSL -> candidates -> rank -> refine |
+| Sing | 歌词转歌曲 demo / lyrics-to-song demo | 旋律、MIDI、TTS/合成歌声、混音、音频下载 / melody, MIDI, TTS/synthetic vocals, mixing, audio download |
+
+## 项目结构 / Project Structure
 
 ```text
 backend/
-  main.py                  # FastAPI 入口
-  api/generate.py          # /api/generate 与 /api/generate/stream
-  services/generator.py    # Simple Mode + Advanced Mode 调度
-  schemas/generate.py      # 请求 / 响应 schema
+  main.py                  # FastAPI 入口 / FastAPI entry
+  api/generate.py          # 歌词/诗歌生成 API / lyric/poem generation API
+  api/sing.py              # 歌词转歌曲 API / lyrics-to-song API
+  services/generator.py    # Simple / Advanced 生成调度 / generation orchestration
+  services/singer.py       # 旋律、MIDI、TTS、混音调度 / melody, MIDI, TTS, mixing orchestration
 
 frontend/
-  src/App.vue              # 主 UI，模式切换与 SSE 消费
-  src/components/
-    LivePipeline.vue       # 步骤与耗时展示
-    ResultComparison.vue   # 结果展示
-    ExplanationPanel.vue   # 创作说明
+  src/App.vue              # Web UI 主界面 / main Web UI
+  src/components/          # pipeline、结果、评分、说明组件 / pipeline, result, score, explanation components
 
 agent_os/
-  art_layer.py             # LLM streaming、风格模板、艺术层工具
-  integration.py           # Advanced Mode 的 AgentOS pipeline
+  art_layer.py             # LLM、风格模板、情绪对象 / LLM, style templates, emotion objects
+  integration.py           # Advanced Mode pipeline
+  melody_generator.py      # 旋律生成 / melody generation
+  audio_engine.py          # MIDI、TTS、混音 / MIDI, TTS, mixing
 ```
 
----
+## 隐私说明 / Privacy
 
-## 设计取舍
+本项目适合本地运行。聊天记录只会在你本机服务和你配置的模型 API 之间流转；如果你处理真实聊天记录，请先脱敏姓名、电话、地址、账号和私密内容。  
+This project is designed for local use. Chat logs only flow between your local server and the model API you configure. If you process real conversations, remove names, phone numbers, addresses, accounts, and private content first.
 
-本项目不把复杂度放在默认路径里。
+## 当前限制 / Limitations
 
-默认路径追求：
+- 歌曲生成是 demo 级，不等同于 Suno/Udio 级商业音乐生成。  
+  Song generation is demo-level and not comparable to commercial systems such as Suno or Udio.
 
-- 稳定
-- 快
-- 可观测
-- 用户能看到实时反馈
+- TTS 演唱自然度依赖 `edge-tts`、音高切片和混音质量。  
+  Vocal naturalness depends on `edge-tts`, pitch slicing, and mixing quality.
 
-高级路径保留：
+- Advanced Mode 成本和延迟明显高于 Simple Mode。  
+  Advanced Mode costs more and is slower than Simple Mode.
 
-- 多候选
-- rerank
-- refine
-- DSL / Emotion pipeline
+- 微信聊天记录解析目前偏文本输入，后续会补更严格的导入格式解析。  
+  WeChat chat parsing currently focuses on plain text input; stricter import format support is planned.
 
-这对应真实工程中的取舍：**fast path 服务大多数请求，slow path 作为可选增强能力。**
+## Roadmap
+
+详见 [ROADMAP.md](ROADMAP.md)。  
+See [ROADMAP.md](ROADMAP.md).
+
+近期重点：  
+Near-term focus:
+
+- 微信聊天 `.txt/.csv/.json` 导入解析  
+  WeChat `.txt/.csv/.json` import parsing
+
+- 在线 demo / 截图 / 音频样例  
+  Online demo, screenshots, and audio samples
+
+- Docker Compose 一键启动  
+  One-command startup with Docker Compose
+
+- 本地模型适配：Ollama / Qwen / DeepSeek / OpenAI  
+  Local/provider model adapters: Ollama / Qwen / DeepSeek / OpenAI
+
+- 歌词押韵控制、Hook 强化、风格模板市场  
+  Rhyme control, stronger hooks, and a style-template marketplace
+
+## License
+
+MIT License. See [LICENSE](LICENSE).  
+MIT License. See [LICENSE](LICENSE).

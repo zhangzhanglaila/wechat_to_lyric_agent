@@ -1,5 +1,5 @@
 """
-GenWriter Agent - FastAPI Backend
+WeChat2Song / GenWriter Agent - FastAPI Backend
 """
 import os
 from dotenv import load_dotenv
@@ -14,8 +14,8 @@ from backend.api.generate import router as generate_router
 from backend.api.sing import router as sing_router
 
 app = FastAPI(
-    title="GenWriter Agent API",
-    description="可控歌词/诗歌生成系统 — LLM + 搜索优化",
+    title="WeChat2Song API",
+    description="微信聊天记录、关键词或故事转中文歌词，并继续生成可播放歌曲 demo。",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -50,7 +50,7 @@ else:
 if __name__ == "__main__":
     import uvicorn
     print()
-    print("GenWriter Agent")
+    print("WeChat2Song / GenWriter Agent")
     print("   Server:  http://localhost:8000")
     print("   API:     http://localhost:8000/docs")
     print()
